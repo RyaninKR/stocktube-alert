@@ -7,3 +7,4 @@ youtube-transcript-api>=0.6.0
 openai>=1.0.0
 pykrx>=1.0.0
 python-dotenv>=1.0.0
+asyncpg>=0.29.0
