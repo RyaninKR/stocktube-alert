@@ -1,5 +1,5 @@
 """
-StockTube Alert MVP v0.4.0
+StockTube Alert MVP v0.5.0
 YouTube 투자 영상 → AI 검색식 자동 생성 → 실시간 종목 스크리닝
 웹앱 + 텔레그램 미니앱 동시 지원 + PostgreSQL + 워치리스트
 """
@@ -51,7 +51,7 @@ async def lifespan(app: FastAPI):
     await db_pool.close()
 
 
-app = FastAPI(title="StockTube Alert MVP", version="0.4.0", lifespan=lifespan)
+app = FastAPI(title="StockTube Alert MVP", version="0.5.0", lifespan=lifespan)
 
 
 # ─── Pydantic Models ───
@@ -288,10 +288,38 @@ async def read_index():
                 const res = await fetch('/api/analyze', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({youtube_url:url})});
                 const data = await res.json();
                 lastAnalysis = data;
-                document.getElementById('analyze-result').textContent = JSON.stringify(data, null, 2);
+                // 보기 좋게 포맷
+                let html = '';
+                if (data.error) {
+                    html = `<b>오류:</b> ${data.error}`;
+                } else {
+                    html += `<b>📌 전략 요약</b>\n${data.strategy_summary || 'N/A'}\n\n`;
+                    if (data.strategy_tags) html += `<b>🏷 태그:</b> ${data.strategy_tags.join(', ')}\n\n`;
+                    if (data.mentioned_stocks?.length) html += `<b>📊 언급 종목:</b> ${data.mentioned_stocks.join(', ')}\n\n`;
+                    if (data.screen_filters) {
+                        const filterLabels = {per:'PER',pbr:'PBR',roe:'ROE',roa:'ROA',eps:'EPS',bps:'BPS',div:'배당률',dps:'주당배당금',debt_ratio:'부채비율',market_cap:'시가총액',revenue_growth:'매출성장률',operating_margin:'영업이익률'};
+                        const opLabels = {lte:'≤',gte:'≥',lt:'<',gt:'>',eq:'='};
+                        html += `<b>🔍 검색식:</b>\n`;
+                        for (const [k,v] of Object.entries(data.screen_filters)) {
+                            const parts = k.rsplit ? k.split('_') : k.split('_');
+                            const op = parts.pop();
+                            const col = parts.join('_');
+                            html += `  • ${(filterLabels[col]||col.toUpperCase())} ${opLabels[op]||op} ${v}\n`;
+                        }
+                        html += '\n';
+                    }
+                    if (data.key_insights?.length) {
+                        html += `<b>💡 핵심 인사이트:</b>\n`;
+                        data.key_insights.forEach(i => html += `  • ${i}\n`);
+                        html += '\n';
+                    }
+                    html += `<b>신뢰도:</b> ${Math.round((data.confidence||0)*100)}%`;
+                }
+                document.getElementById('analyze-result').innerHTML = html.replace(/\n/g, '<br>');
                 if (data.screen_filters) {
                     document.getElementById('save-watchlist-section').style.display = 'block';
-                    document.getElementById('wl-name').value = data.strategy_summary?.substring(0, 30) || '새 검색식';
+                    const tags = data.strategy_tags ? ` [${data.strategy_tags[0]}]` : '';
+                    document.getElementById('wl-name').value = (data.strategy_summary?.substring(0, 25) || '새 검색식') + tags;
                     document.getElementById('screen-filters').value = JSON.stringify(data.screen_filters);
                 }
             } catch(e) { document.getElementById('analyze-result').textContent = '오류: ' + e.message; }
@@ -719,16 +747,59 @@ async def _parse_with_ai(transcript: str) -> dict:
         from openai import AsyncOpenAI
         client = AsyncOpenAI(api_key=OPENAI_API_KEY)
         response = await client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-4o",
             messages=[
-                {"role": "system", "content": """당신은 주식 투자 전문가입니다. YouTube 투자 영상의 자막을 분석하여 다음을 추출하세요:
-1. 핵심 투자 전략 요약
-2. 언급된 종목 리스트
-3. 종목 스크리닝 검색식 (PER, PBR, ROE 등 재무지표 기반 필터)
+                {"role": "system", "content": """당신은 한국 주식 시장 전문 퀀트 애널리스트입니다. YouTube 투자 영상의 자막을 정밀하게 분석하여 **영상에서 실제로 언급된 구체적인 수치와 조건**을 추출하세요.
 
-JSON 형식으로 응답:
-{"strategy_summary": "전략 요약", "mentioned_stocks": ["종목1"], "screen_filters": {"per_lte": 10, "roe_gte": 15}, "confidence": 0.8}"""},
-                {"role": "user", "content": f"다음 자막을 분석해주세요:\n\n{transcript[:4000]}"}
+## 추출 규칙
+1. **strategy_summary**: 영상의 핵심 투자 전략을 2-3문장으로 요약
+2. **mentioned_stocks**: 영상에서 직접 언급된 종목명 (추측하지 말 것)
+3. **screen_filters**: 영상에서 언급된 **구체적 재무 지표 조건**을 필터로 변환
+4. **strategy_tags**: 전략 유형 태그 (예: "가치투자", "모멘텀", "배당", "성장주", "턴어라운드" 등)
+5. **key_insights**: 영상의 핵심 인사이트 3-5개 (배열)
+6. **confidence**: 검색식의 신뢰도 (0.0~1.0)
+
+## 사용 가능한 필터 키
+재무지표_조건 형식. 조건: lte(이하), gte(이상), lt(미만), gt(초과), eq(같음)
+
+- per_lte, per_gte: PER (주가수익비율)
+- pbr_lte, pbr_gte: PBR (주가순자산비율)  
+- eps_gte: EPS (주당순이익)
+- bps_gte: BPS (주당순자산)
+- div_gte: 배당수익률(%)
+- dps_gte: 주당배당금
+- roe_gte: ROE (자기자본이익률)
+- roa_gte: ROA (총자산이익률)
+- debt_ratio_lte: 부채비율
+- market_cap_gte, market_cap_lte: 시가총액
+- revenue_growth_gte: 매출성장률
+- operating_margin_gte: 영업이익률
+
+## 중요
+- 영상에서 **명시적으로 언급한 수치**를 우선 사용하세요
+- 수치가 언급되지 않았지만 전략에서 유추 가능한 경우, 합리적인 범위를 설정하고 confidence를 낮추세요
+- 가능한 한 **3개 이상의 필터 조건**을 생성하세요
+- 단순히 PER/ROE만 넣지 말고, 영상 내용에 맞는 다양한 지표를 활용하세요
+
+## 응답 형식 (JSON)
+{
+  "strategy_summary": "구체적 전략 요약",
+  "mentioned_stocks": ["삼성전자", "SK하이닉스"],
+  "screen_filters": {
+    "per_lte": 15,
+    "pbr_lte": 1.5,
+    "roe_gte": 10,
+    "div_gte": 2.0,
+    "eps_gte": 1000
+  },
+  "strategy_tags": ["가치투자", "배당"],
+  "key_insights": [
+    "현재 시장은 가치주 중심으로 재편 중",
+    "PER 15 이하 종목 중 배당수익률 2% 이상이 유망"
+  ],
+  "confidence": 0.75
+}"""},
+                {"role": "user", "content": f"다음 YouTube 투자 영상 자막을 분석하여 종목 스크리닝 검색식을 생성해주세요. 영상에서 언급된 구체적 수치와 조건을 최대한 반영하세요:\n\n{transcript[:6000]}"}
             ],
             response_format={"type": "json_object"},
         )
