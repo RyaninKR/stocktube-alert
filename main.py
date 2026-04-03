@@ -35,6 +35,7 @@ logger = logging.getLogger(__name__)
 # ─── Config ───
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 WEBAPP_URL = os.getenv("WEBAPP_URL", "")
 
 # ─── DB Pool ───
@@ -741,8 +742,10 @@ async def telegram_webhook(request: Request):
 
 # ─── AI Helper ───
 async def _parse_with_ai(transcript: str) -> dict:
+    if ANTHROPIC_API_KEY:
+        return await _parse_with_claude(transcript)
     if not OPENAI_API_KEY:
-        return {"error": "OPENAI_API_KEY not configured", "transcript_preview": transcript[:200]}
+        return {"error": "API key not configured", "transcript_preview": transcript[:200]}
     try:
         from openai import AsyncOpenAI
         client = AsyncOpenAI(api_key=OPENAI_API_KEY)
@@ -806,6 +809,79 @@ async def _parse_with_ai(transcript: str) -> dict:
         return json.loads(response.choices[0].message.content)
     except Exception as e:
         return {"error": f"AI parsing failed: {str(e)}"}
+
+
+async def _parse_with_claude(transcript: str) -> dict:
+    """Claude 4.6 Sonnet으로 투자 전략 파싱"""
+    try:
+        async with httpx.AsyncClient() as client:
+            # Get the system prompt from the OpenAI path
+            system_prompt = """당신은 한국 주식 시장 전문 퀀트 애널리스트입니다. YouTube 투자 영상의 자막을 정밀하게 분석하여 **영상에서 실제로 언급된 구체적인 수치와 조건**을 추출하세요.
+
+## 추출 규칙
+1. **strategy_summary**: 영상의 핵심 투자 전략을 2-3문장으로 요약
+2. **mentioned_stocks**: 영상에서 직접 언급된 종목명 (추측하지 말 것)
+3. **screen_filters**: 영상에서 언급된 **구체적 재무 지표 조건**을 필터로 변환
+4. **strategy_tags**: 전략 유형 태그 (예: "가치투자", "모멘텀", "배당", "성장주", "턴어라운드" 등)
+5. **key_insights**: 영상의 핵심 인사이트 3-5개 (배열)
+6. **confidence**: 검색식의 신뢰도 (0.0~1.0)
+
+## 사용 가능한 필터 키
+재무지표_조건 형식. 조건: lte(이하), gte(이상), lt(미만), gt(초과), eq(같음)
+
+- per_lte, per_gte: PER (주가수익비율)
+- pbr_lte, pbr_gte: PBR (주가순자산비율)
+- eps_gte: EPS (주당순이익)
+- bps_gte: BPS (주당순자산)
+- div_gte: 배당수익률(%)
+- dps_gte: 주당배당금
+- roe_gte: ROE (자기자본이익률)
+- roa_gte: ROA (총자산이익률)
+- debt_ratio_lte: 부채비율
+- market_cap_gte, market_cap_lte: 시가총액
+- revenue_growth_gte: 매출성장률
+- operating_margin_gte: 영업이익률
+
+## 중요
+- 영상에서 **명시적으로 언급한 수치**를 우선 사용하세요
+- 수치가 언급되지 않았지만 전략에서 유추 가능한 경우, 합리적인 범위를 설정하고 confidence를 낮추세요
+- 가능한 한 **3개 이상의 필터 조건**을 생성하세요
+- 단순히 PER/ROE만 넣지 말고, 영상 내용에 맞는 다양한 지표를 활용하세요
+
+반드시 JSON만 출력하세요. 다른 텍스트 없이 JSON 객체만 반환하세요."""
+
+            resp = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": ANTHROPIC_API_KEY,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json={
+                    "model": "claude-sonnet-4-20250514",
+                    "max_tokens": 2048,
+                    "system": system_prompt,
+                    "messages": [
+                        {"role": "user", "content": f"다음 YouTube 투자 영상 자막을 분석하여 종목 스크리닝 검색식을 생성해주세요. 영상에서 언급된 구체적 수치와 조건을 최대한 반영하세요:\n\n{transcript[:8000]}"}
+                    ],
+                },
+                timeout=60,
+            )
+
+            data = resp.json()
+            content = data["content"][0]["text"]
+
+            # JSON 추출 (```json ... ``` 감싸진 경우 처리)
+            if "```json" in content:
+                content = content.split("```json")[1].split("```")[0]
+            elif "```" in content:
+                content = content.split("```")[1].split("```")[0]
+
+            return json.loads(content.strip())
+
+    except Exception as e:
+        logger.error(f"Claude parsing failed: {e}")
+        return {"error": f"Claude parsing failed: {str(e)}"}
 
 
 if __name__ == "__main__":
