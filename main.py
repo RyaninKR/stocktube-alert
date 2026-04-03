@@ -568,38 +568,119 @@ async def get_history_api(watchlist_id: int):
 # ─── 기존 API (호환 유지) ───
 @app.post("/api/analyze")
 async def analyze_video(req: AnalyzeUrlRequest):
+    import re
+    import subprocess
+    import tempfile
+
+    patterns = [r'(?:v=|/v/|youtu\.be/)([a-zA-Z0-9_-]{11})']
+    video_id = None
+    for pattern in patterns:
+        match = re.search(pattern, req.youtube_url)
+        if match:
+            video_id = match.group(1)
+            break
+
+    if not video_id:
+        return {"error": "유효한 YouTube URL이 아닙니다"}
+
+    transcript_text = None
+    extraction_method = None
+
+    # 방법 1: yt-dlp로 자막 추출 (클라우드 IP 우회 가능)
     try:
-        from youtube_transcript_api import YouTubeTranscriptApi
-        import re
+        result = subprocess.run(
+            ["yt-dlp", "--skip-download", "--write-auto-sub", "--write-sub",
+             "--sub-lang", "ko,en", "--sub-format", "json3",
+             "--output", "%(id)s", req.youtube_url],
+            capture_output=True, text=True, timeout=30,
+            cwd=tempfile.gettempdir()
+        )
 
-        patterns = [r'(?:v=|/v/|youtu\.be/)([a-zA-Z0-9_-]{11})']
-        video_id = None
-        for pattern in patterns:
-            match = re.search(pattern, req.youtube_url)
-            if match:
-                video_id = match.group(1)
-                break
+        # 자막 파일 찾기
+        import glob
+        sub_files = glob.glob(f"{tempfile.gettempdir()}/{video_id}*.json3")
+        if sub_files:
+            with open(sub_files[0], 'r') as f:
+                sub_data = json.load(f)
+            # json3 형식에서 텍스트 추출
+            segments = sub_data.get("events", [])
+            texts = []
+            for seg in segments:
+                segs = seg.get("segs", [])
+                for s in segs:
+                    t = s.get("utf8", "").strip()
+                    if t and t != "\n":
+                        texts.append(t)
+            transcript_text = " ".join(texts)
+            extraction_method = "yt-dlp"
+            # 임시 파일 정리
+            for f in sub_files:
+                os.remove(f)
 
-        if not video_id:
-            return {"error": "유효한 YouTube URL이 아닙니다"}
+        if not transcript_text:
+            # yt-dlp로 자막 파일이 없는 경우 - vtt 시도
+            result2 = subprocess.run(
+                ["yt-dlp", "--skip-download", "--write-auto-sub", "--write-sub",
+                 "--sub-lang", "ko,en", "--sub-format", "vtt",
+                 "--output", "%(id)s", req.youtube_url],
+                capture_output=True, text=True, timeout=30,
+                cwd=tempfile.gettempdir()
+            )
+            vtt_files = glob.glob(f"{tempfile.gettempdir()}/{video_id}*.vtt")
+            if vtt_files:
+                with open(vtt_files[0], 'r') as f:
+                    vtt_content = f.read()
+                # VTT에서 텍스트만 추출
+                lines = []
+                for line in vtt_content.split('\n'):
+                    line = line.strip()
+                    if not line or '-->' in line or line.startswith('WEBVTT') or line.startswith('Kind:') or line.startswith('Language:') or re.match(r'^\d+$', line):
+                        continue
+                    # HTML 태그 제거
+                    clean = re.sub(r'<[^>]+>', '', line)
+                    if clean:
+                        lines.append(clean)
+                transcript_text = " ".join(lines)
+                extraction_method = "yt-dlp-vtt"
+                for f in vtt_files:
+                    os.remove(f)
 
+    except FileNotFoundError:
+        logger.warning("yt-dlp not installed")
+    except subprocess.TimeoutExpired:
+        logger.warning("yt-dlp timeout")
+    except Exception as e:
+        logger.warning(f"yt-dlp failed: {e}")
+
+    # 방법 2: youtube-transcript-api fallback
+    if not transcript_text:
         try:
+            from youtube_transcript_api import YouTubeTranscriptApi
             ytt = YouTubeTranscriptApi()
             transcript = ytt.fetch(video_id, languages=['ko', 'en'])
             transcript_text = " ".join([snippet.text for snippet in transcript])
+            extraction_method = "youtube-transcript-api"
         except Exception as e:
-            return {"error": f"자막 추출 실패: {str(e)}"}
+            return {"error": f"자막 추출 실패: {str(e)}\n\nYouTube가 서버 IP를 차단했을 수 있습니다. 자막이 있는 다른 영상으로 시도해보세요."}
 
-        result = await _parse_with_ai(transcript_text)
-        result["video_id"] = video_id
-        result["youtube_url"] = req.youtube_url
-        return result
+    if not transcript_text or len(transcript_text.strip()) < 50:
+        return {"error": "자막을 찾을 수 없거나 내용이 너무 짧습니다. 자막이 있는 영상인지 확인해주세요."}
 
-    except ImportError:
-        return {"error": "youtube_transcript_api not installed"}
-    except Exception as e:
-        logger.error(f"Analyze error: {e}")
-        return {"error": str(e)}
+    # 중복 텍스트 제거 (자동자막 특성)
+    words = transcript_text.split()
+    deduped = [words[0]] if words else []
+    for w in words[1:]:
+        if w != deduped[-1]:
+            deduped.append(w)
+    transcript_text = " ".join(deduped)
+
+    logger.info(f"Transcript extracted via {extraction_method}: {len(transcript_text)} chars")
+
+    result = await _parse_with_ai(transcript_text)
+    result["video_id"] = video_id
+    result["youtube_url"] = req.youtube_url
+    result["extraction_method"] = extraction_method
+    return result
 
 
 @app.post("/api/parse")
