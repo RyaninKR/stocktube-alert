@@ -48,61 +48,109 @@ def is_market_hours() -> bool:
 
 
 def fetch_market_data() -> dict:
-    """KRX 시장 데이터 가져오기"""
-    from pykrx import stock
+    """KRX 시장 데이터 가져오기 (pykrx + 직접 API fallback)"""
+    import pandas as pd
+    import requests
 
     today = datetime.now(KST).strftime("%Y%m%d")
-    df = stock.get_market_fundamental(today, market="ALL")
+    df = None
 
-    if df.empty:
-        from pykrx.stock import get_nearest_business_day_in_a_week
-        today = get_nearest_business_day_in_a_week(today)
+    # 방법 1: pykrx
+    try:
+        from pykrx import stock
         df = stock.get_market_fundamental(today, market="ALL")
+        if df is not None and not df.empty:
+            logger.info(f"pykrx data loaded: {len(df)} rows")
+            return {"date": today, "data": df}
+    except Exception as e:
+        logger.warning(f"pykrx failed: {e}")
 
-    if df.empty:
-        logger.warning("No market data available")
-        return {"date": today, "data": None}
+    # 방법 2: KRX 직접 API
+    try:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Referer': 'http://data.krx.co.kr/contents/MDC/MDI/mdiLoader/index.cmd?menuId=MDC0201020101'
+        }
+        params = {
+            'bld': 'dbms/MDC/STAT/standard/MDCSTAT03501',
+            'locale': 'ko_KR',
+            'searchType': '1',
+            'mktId': 'ALL',
+            'trdDd': today,
+        }
+        resp = requests.post(
+            'http://data.krx.co.kr/comm/bldAttendant/getJsonData.cmd',
+            data=params, headers=headers, timeout=15
+        )
+        data = resp.json()
+        if 'output' in data and data['output']:
+            df = pd.DataFrame(data['output'])
+            # 컬럼 정리
+            col_map = {}
+            for col in df.columns:
+                upper = col.upper()
+                if 'PER' in upper and 'BPS' not in upper: col_map[col] = 'PER'
+                elif 'PBR' in upper: col_map[col] = 'PBR'
+                elif 'EPS' in upper: col_map[col] = 'EPS'
+                elif 'BPS' in upper: col_map[col] = 'BPS'
+                elif 'DIV' in upper or '배당' in col: col_map[col] = 'DIV'
+                elif 'DPS' in upper: col_map[col] = 'DPS'
+                elif '종목코드' in col or 'ISU_SRT_CD' in col: col_map[col] = 'ticker'
+                elif '종목명' in col or 'ISU_ABBRV' in col: col_map[col] = '종목명'
+            if col_map:
+                df = df.rename(columns=col_map)
+            if 'ticker' in df.columns:
+                df = df.set_index('ticker')
+            for col in ['PER', 'PBR', 'EPS', 'BPS', 'DIV', 'DPS']:
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col].astype(str).str.replace(',', ''), errors='coerce')
+            logger.info(f"KRX direct data loaded: {len(df)} rows")
+            return {"date": today, "data": df}
+    except Exception as e:
+        logger.warning(f"KRX direct failed: {e}")
 
-    return {"date": today, "data": df}
+    logger.warning("No market data available from any source")
+    return {"date": today, "data": None}
 
 
 def apply_filters(df, filters: dict) -> list:
     """필터를 적용하여 매칭 종목 반환"""
-    from pykrx import stock
-
     results = df.copy()
     for key, value in filters.items():
         parts = key.rsplit("_", 1)
         if len(parts) != 2:
             continue
         col, op = parts
-        col = col.upper()
-        if col not in results.columns:
+        col_upper = col.upper()
+        # 컬럼명 매칭
+        matched_col = None
+        for c in results.columns:
+            if c.upper() == col_upper:
+                matched_col = c
+                break
+        if matched_col is None:
             continue
         try:
             if op == "lte":
-                results = results[(results[col] <= value) & (results[col] > 0)]
+                results = results[(results[matched_col] <= value) & (results[matched_col] > 0)]
             elif op == "gte":
-                results = results[results[col] >= value]
+                results = results[results[matched_col] >= value]
             elif op == "eq":
-                results = results[results[col] == value]
+                results = results[results[matched_col] == value]
             elif op == "lt":
-                results = results[(results[col] < value) & (results[col] > 0)]
+                results = results[(results[matched_col] < value) & (results[matched_col] > 0)]
             elif op == "gt":
-                results = results[results[col] > value]
+                results = results[results[matched_col] > value]
         except Exception as e:
             logger.warning(f"Filter error {key}={value}: {e}")
 
     matched = []
-    for ticker in results.index.tolist()[:100]:  # 최대 100개
-        try:
-            name = stock.get_market_ticker_name(ticker)
-        except:
-            name = ticker
+    for ticker in results.index.tolist()[:100]:
         row = results.loc[ticker]
+        name = row.get("종목명", ticker) if hasattr(row, 'get') else ticker
         matched.append({
             "ticker": ticker,
-            "name": name,
+            "name": str(name),
             "data": {col: float(row[col]) if hasattr(row[col], 'item') else row[col]
                      for col in results.columns if col != "종목명"},
         })

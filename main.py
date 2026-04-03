@@ -1,5 +1,5 @@
 """
-StockTube Alert MVP v0.3.0
+StockTube Alert MVP v0.4.0
 YouTube 투자 영상 → AI 검색식 자동 생성 → 실시간 종목 스크리닝
 웹앱 + 텔레그램 미니앱 동시 지원 + PostgreSQL + 워치리스트
 """
@@ -51,7 +51,7 @@ async def lifespan(app: FastAPI):
     await db_pool.close()
 
 
-app = FastAPI(title="StockTube Alert MVP", version="0.3.0", lifespan=lifespan)
+app = FastAPI(title="StockTube Alert MVP", version="0.4.0", lifespan=lifespan)
 
 
 # ─── Pydantic Models ───
@@ -475,8 +475,9 @@ async def analyze_video(req: AnalyzeUrlRequest):
             return {"error": "유효한 YouTube URL이 아닙니다"}
 
         try:
-            transcript_list = YouTubeTranscriptApi.get_transcript(video_id, languages=['ko', 'en'])
-            transcript_text = " ".join([t['text'] for t in transcript_list])
+            ytt = YouTubeTranscriptApi()
+            transcript = ytt.fetch(video_id, languages=['ko', 'en'])
+            transcript_text = " ".join([snippet.text for snippet in transcript])
         except Exception as e:
             return {"error": f"자막 추출 실패: {str(e)}"}
 
@@ -500,33 +501,175 @@ async def parse_transcript(req: ParseRequest):
 @app.post("/api/screen")
 async def screen_stocks_api(req: ScreenRequest):
     try:
-        from pykrx import stock
-        today = datetime.now().strftime("%Y%m%d")
-        df = stock.get_market_fundamental(today, market="ALL")
-        if df.empty:
-            from pykrx.stock import get_nearest_business_day_in_a_week
-            today = get_nearest_business_day_in_a_week(datetime.now().strftime("%Y%m%d"))
-            df = stock.get_market_fundamental(today, market="ALL")
-
-        results = df.copy()
-        for key, value in req.filters.items():
-            col, op = key.rsplit("_", 1)
-            col = col.upper()
-            if col not in results.columns:
-                continue
-            if op == "lte": results = results[results[col] <= value]
-            elif op == "gte": results = results[results[col] >= value]
-            elif op == "eq": results = results[results[col] == value]
-
-        tickers = results.index.tolist()
-        names = {t: stock.get_market_ticker_name(t) for t in tickers[:50]}
-        results = results.head(50)
-        results["종목명"] = results.index.map(lambda x: names.get(x, ""))
-
-        return {"count": len(results), "date": today, "stocks": results.reset_index().to_dict(orient="records")}
+        result = await _screen_stocks(req.filters)
+        return result
     except Exception as e:
         logger.error(f"Screen error: {e}")
         return {"error": str(e)}
+
+
+async def _screen_stocks(filters: dict) -> dict:
+    """KRX 데이터로 종목 스크리닝 (pykrx fallback 포함)"""
+    import pandas as pd
+
+    df = None
+    today = datetime.now().strftime("%Y%m%d")
+    source = "unknown"
+
+    # 방법 1: pykrx
+    try:
+        from pykrx import stock
+        df = stock.get_market_fundamental(today, market="ALL")
+        if df is not None and not df.empty:
+            source = "pykrx"
+    except Exception as e:
+        logger.warning(f"pykrx failed: {e}")
+
+    # 방법 2: KRX 직접 API
+    if df is None or df.empty:
+        try:
+            df, today = await _fetch_krx_direct(today)
+            if df is not None and not df.empty:
+                source = "krx_direct"
+        except Exception as e:
+            logger.warning(f"KRX direct failed: {e}")
+
+    if df is None or df.empty:
+        return {"error": "시장 데이터를 가져올 수 없습니다. 장 운영 시간을 확인해주세요.", "date": today}
+
+    # 필터 적용
+    results = df.copy()
+    applied_filters = []
+    for key, value in filters.items():
+        parts = key.rsplit("_", 1)
+        if len(parts) != 2:
+            continue
+        col, op = parts
+        col_upper = col.upper()
+        # 컬럼명 매칭 (대소문자 무시)
+        matched_col = None
+        for c in results.columns:
+            if c.upper() == col_upper:
+                matched_col = c
+                break
+        if matched_col is None:
+            continue
+
+        try:
+            if op == "lte":
+                results = results[(results[matched_col] <= value) & (results[matched_col] > 0)]
+            elif op == "gte":
+                results = results[results[matched_col] >= value]
+            elif op == "eq":
+                results = results[results[matched_col] == value]
+            elif op == "lt":
+                results = results[(results[matched_col] < value) & (results[matched_col] > 0)]
+            elif op == "gt":
+                results = results[results[matched_col] > value]
+            applied_filters.append(f"{matched_col} {op} {value}")
+        except Exception as e:
+            logger.warning(f"Filter {key}={value} error: {e}")
+
+    # 종목명 추가
+    tickers = results.index.tolist()[:50]
+    if source == "pykrx":
+        try:
+            from pykrx import stock
+            names = {t: stock.get_market_ticker_name(t) for t in tickers}
+        except:
+            names = {}
+    else:
+        names = {}
+
+    results = results.head(50)
+    if "종목명" not in results.columns and names:
+        results = results.copy()
+        results["종목명"] = results.index.map(lambda x: names.get(x, ""))
+
+    stocks = []
+    for idx, row in results.iterrows():
+        stock_data = {"ticker": idx}
+        for col in results.columns:
+            val = row[col]
+            if hasattr(val, 'item'):
+                val = val.item()
+            stock_data[col] = val
+        stocks.append(stock_data)
+
+    return {
+        "count": len(stocks),
+        "date": today,
+        "source": source,
+        "filters_applied": applied_filters,
+        "stocks": stocks,
+    }
+
+
+async def _fetch_krx_direct(date: str):
+    """KRX API 직접 호출 (pykrx 우회)"""
+    import pandas as pd
+
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Referer': 'http://data.krx.co.kr/contents/MDC/MDI/mdiLoader/index.cmd?menuId=MDC0201020101'
+    }
+    params = {
+        'bld': 'dbms/MDC/STAT/standard/MDCSTAT03501',
+        'locale': 'ko_KR',
+        'searchType': '1',
+        'mktId': 'ALL',
+        'trdDd': date,
+    }
+
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            'http://data.krx.co.kr/comm/bldAttendant/getJsonData.cmd',
+            data=params,
+            headers=headers,
+            timeout=15,
+        )
+        data = resp.json()
+
+    if 'output' not in data or not data['output']:
+        return None, date
+
+    records = data['output']
+    df = pd.DataFrame(records)
+
+    # 컬럼 정리 - KRX 응답 컬럼명을 표준화
+    col_map = {}
+    for col in df.columns:
+        upper = col.upper()
+        if 'PER' in upper and 'BPS' not in upper:
+            col_map[col] = 'PER'
+        elif 'PBR' in upper:
+            col_map[col] = 'PBR'
+        elif 'EPS' in upper:
+            col_map[col] = 'EPS'
+        elif 'BPS' in upper:
+            col_map[col] = 'BPS'
+        elif 'DIV' in upper or '배당' in col:
+            col_map[col] = 'DIV'
+        elif 'DPS' in upper:
+            col_map[col] = 'DPS'
+        elif '종목코드' in col or 'ISU_SRT_CD' in col:
+            col_map[col] = 'ticker'
+        elif '종목명' in col or 'ISU_ABBRV' in col:
+            col_map[col] = '종목명'
+
+    if col_map:
+        df = df.rename(columns=col_map)
+
+    # ticker를 인덱스로
+    if 'ticker' in df.columns:
+        df = df.set_index('ticker')
+
+    # 숫자 변환
+    for col in ['PER', 'PBR', 'EPS', 'BPS', 'DIV', 'DPS']:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col].astype(str).str.replace(',', ''), errors='coerce')
+
+    return df, date
 
 
 @app.post("/api/notify")
