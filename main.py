@@ -150,7 +150,24 @@ async def read_index():
         .btn-success { background: var(--success); color: #fff; }
         .btn-sm { width: auto; padding: 6px 12px; font-size: 0.8rem; }
         .btn:disabled { opacity: 0.5; }
-        .result { margin-top: 12px; white-space: pre-wrap; font-size: 0.85rem; max-height: 300px; overflow-y: auto; }
+        .result { margin-top: 12px; white-space: pre-wrap; font-size: 0.85rem; max-height: 400px; overflow-y: auto; }
+        .analysis-card { background: var(--bg); border: 1px solid var(--border); border-radius: 10px; padding: 14px; margin-top: 12px; }
+        .analysis-card + .analysis-card { margin-top: 8px; }
+        .analysis-card h3 { font-size: 0.9rem; margin-bottom: 8px; display: flex; align-items: center; gap: 6px; }
+        .filter-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+        .filter-chip { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 10px; text-align: center; }
+        .filter-chip .filter-label { font-size: 0.75rem; color: #888; }
+        .filter-chip .filter-value { font-size: 1.1rem; font-weight: 700; color: var(--primary); margin-top: 2px; }
+        .filter-chip .filter-op { font-size: 0.7rem; color: #aaa; }
+        .tag { display: inline-block; background: #e8f4fd; color: #0077b6; padding: 3px 10px; border-radius: 12px; font-size: 0.78rem; font-weight: 600; margin: 2px; }
+        .insight-item { padding: 6px 0; font-size: 0.85rem; display: flex; gap: 6px; }
+        .insight-item + .insight-item { border-top: 1px solid var(--border); }
+        .stock-chip { display: inline-block; background: #fff3cd; color: #856404; padding: 3px 10px; border-radius: 12px; font-size: 0.82rem; font-weight: 600; margin: 2px; }
+        .confidence-bar { height: 6px; background: #eee; border-radius: 3px; margin-top: 6px; overflow: hidden; }
+        .confidence-fill { height: 100%; border-radius: 3px; transition: width 0.5s; }
+        .conf-high { background: var(--success); }
+        .conf-mid { background: #ffc107; }
+        .conf-low { background: var(--danger); }
         .toggle-row { display: flex; justify-content: space-between; align-items: center; padding: 8px 0; }
         .toggle-row + .toggle-row { border-top: 1px solid var(--border); }
         .switch { position: relative; width: 44px; height: 24px; }
@@ -278,52 +295,101 @@ async def read_index():
         }
 
         // ─── Analyze ───
+        const filterLabels = {per:'PER',pbr:'PBR',roe:'ROE',roa:'ROA',eps:'EPS',bps:'BPS',div:'배당률(%)',dps:'주당배당금',debt_ratio:'부채비율(%)',market_cap:'시가총액',revenue_growth:'매출성장률(%)',operating_margin:'영업이익률(%)'};
+        const opLabels = {lte:'이하',gte:'이상',lt:'미만',gt:'초과',eq:'동일'};
+        const opSymbols = {lte:'≤',gte:'≥',lt:'<',gt:'>',eq:'='};
+
+        function formatValue(col, val) {
+            if (col === 'market_cap') {
+                if (val >= 1e12) return (val/1e12).toFixed(1) + '조';
+                if (val >= 1e8) return (val/1e8).toFixed(0) + '억';
+                return val.toLocaleString();
+            }
+            if (typeof val === 'number' && val % 1 !== 0) return val.toFixed(1);
+            return val.toLocaleString();
+        }
+
+        function renderAnalysis(data) {
+            if (data.error) return `<div class="analysis-card"><h3>⚠️ 오류</h3><p>${data.error}</p></div>`;
+
+            let html = '';
+
+            // 전략 요약
+            html += `<div class="analysis-card">
+                <h3>📌 전략 요약</h3>
+                <p style="font-size:0.9rem;line-height:1.5">${data.strategy_summary || 'N/A'}</p>`;
+            if (data.strategy_tags?.length) {
+                html += `<div style="margin-top:8px">${data.strategy_tags.map(t => `<span class="tag">${t}</span>`).join('')}</div>`;
+            }
+            html += `</div>`;
+
+            // 언급 종목
+            if (data.mentioned_stocks?.length) {
+                html += `<div class="analysis-card">
+                    <h3>📊 언급 종목</h3>
+                    <div>${data.mentioned_stocks.map(s => `<span class="stock-chip">${s}</span>`).join('')}</div>
+                </div>`;
+            }
+
+            // 검색식 (핵심!)
+            if (data.screen_filters) {
+                const entries = Object.entries(data.screen_filters);
+                html += `<div class="analysis-card">
+                    <h3>🔍 스크리닝 검색식 <span style="font-size:0.75rem;color:#888">(${entries.length}개 조건)</span></h3>
+                    <div class="filter-grid">`;
+                for (const [k, v] of entries) {
+                    const parts = k.split('_');
+                    const op = parts.pop();
+                    const col = parts.join('_');
+                    html += `<div class="filter-chip">
+                        <div class="filter-label">${filterLabels[col] || col.toUpperCase()}</div>
+                        <div class="filter-value">${opSymbols[op]||op} ${formatValue(col, v)}</div>
+                        <div class="filter-op">${opLabels[op]||op}</div>
+                    </div>`;
+                }
+                html += `</div></div>`;
+            }
+
+            // 핵심 인사이트
+            if (data.key_insights?.length) {
+                html += `<div class="analysis-card">
+                    <h3>💡 핵심 인사이트</h3>`;
+                data.key_insights.forEach(i => {
+                    html += `<div class="insight-item"><span>•</span><span>${i}</span></div>`;
+                });
+                html += `</div>`;
+            }
+
+            // 신뢰도
+            const conf = Math.round((data.confidence || 0) * 100);
+            const confClass = conf >= 70 ? 'conf-high' : conf >= 40 ? 'conf-mid' : 'conf-low';
+            html += `<div class="analysis-card">
+                <h3>📈 분석 신뢰도 <span style="font-weight:700;color:var(--primary)">${conf}%</span></h3>
+                <div class="confidence-bar"><div class="confidence-fill ${confClass}" style="width:${conf}%"></div></div>
+            </div>`;
+
+            return html;
+        }
+
         async function analyzeVideo() {
             const url = document.getElementById('youtube-url').value;
             if (!url) return alert('YouTube URL을 입력하세요');
             const btn = document.getElementById('analyze-btn');
             btn.disabled = true; btn.textContent = '분석 중...';
-            document.getElementById('analyze-result').textContent = '';
+            document.getElementById('analyze-result').innerHTML = '';
             document.getElementById('save-watchlist-section').style.display = 'none';
             try {
                 const res = await fetch('/api/analyze', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({youtube_url:url})});
                 const data = await res.json();
                 lastAnalysis = data;
-                // 보기 좋게 포맷
-                let html = '';
-                if (data.error) {
-                    html = `<b>오류:</b> ${data.error}`;
-                } else {
-                    html += `<b>📌 전략 요약</b>\n${data.strategy_summary || 'N/A'}\n\n`;
-                    if (data.strategy_tags) html += `<b>🏷 태그:</b> ${data.strategy_tags.join(', ')}\n\n`;
-                    if (data.mentioned_stocks?.length) html += `<b>📊 언급 종목:</b> ${data.mentioned_stocks.join(', ')}\n\n`;
-                    if (data.screen_filters) {
-                        const filterLabels = {per:'PER',pbr:'PBR',roe:'ROE',roa:'ROA',eps:'EPS',bps:'BPS',div:'배당률',dps:'주당배당금',debt_ratio:'부채비율',market_cap:'시가총액',revenue_growth:'매출성장률',operating_margin:'영업이익률'};
-                        const opLabels = {lte:'≤',gte:'≥',lt:'<',gt:'>',eq:'='};
-                        html += `<b>🔍 검색식:</b>\n`;
-                        for (const [k,v] of Object.entries(data.screen_filters)) {
-                            const parts = k.rsplit ? k.split('_') : k.split('_');
-                            const op = parts.pop();
-                            const col = parts.join('_');
-                            html += `  • ${(filterLabels[col]||col.toUpperCase())} ${opLabels[op]||op} ${v}\n`;
-                        }
-                        html += '\n';
-                    }
-                    if (data.key_insights?.length) {
-                        html += `<b>💡 핵심 인사이트:</b>\n`;
-                        data.key_insights.forEach(i => html += `  • ${i}\n`);
-                        html += '\n';
-                    }
-                    html += `<b>신뢰도:</b> ${Math.round((data.confidence||0)*100)}%`;
-                }
-                document.getElementById('analyze-result').innerHTML = html.replace(/\n/g, '<br>');
+                document.getElementById('analyze-result').innerHTML = renderAnalysis(data);
                 if (data.screen_filters) {
                     document.getElementById('save-watchlist-section').style.display = 'block';
                     const tags = data.strategy_tags ? ` [${data.strategy_tags[0]}]` : '';
                     document.getElementById('wl-name').value = (data.strategy_summary?.substring(0, 25) || '새 검색식') + tags;
                     document.getElementById('screen-filters').value = JSON.stringify(data.screen_filters);
                 }
-            } catch(e) { document.getElementById('analyze-result').textContent = '오류: ' + e.message; }
+            } catch(e) { document.getElementById('analyze-result').innerHTML = `<div class="analysis-card"><h3>⚠️ 오류</h3><p>${e.message}</p></div>`; }
             finally { btn.disabled = false; btn.textContent = '분석 시작'; }
         }
 
