@@ -332,7 +332,7 @@ async def read_index():
             }
 
             // 검색식 (핵심!)
-            if (data.screen_filters) {
+            if (data.screen_filters && Object.keys(data.screen_filters).length > 0) {
                 const entries = Object.entries(data.screen_filters);
                 html += `<div class="analysis-card">
                     <h3>🔍 스크리닝 검색식 <span style="font-size:0.75rem;color:#888">(${entries.length}개 조건)</span></h3>
@@ -347,7 +347,21 @@ async def read_index():
                         <div class="filter-op">${opLabels[op]||op}</div>
                     </div>`;
                 }
-                html += `</div></div>`;
+                html += `</div>`;
+                // filter_sources (원문 인용)
+                if (data.filter_sources?.length) {
+                    html += `<div style="margin-top:10px;padding:8px;background:#f0f7ff;border-radius:6px;font-size:0.8rem;color:#555">`;
+                    html += `<b>📝 영상 원문:</b><br>`;
+                    data.filter_sources.forEach(s => { html += `<i>"${s}"</i><br>`; });
+                    html += `</div>`;
+                }
+                html += `</div>`;
+            } else {
+                // screen_filters가 비어있으면
+                html += `<div class="analysis-card">
+                    <h3>🔍 스크리닝 검색식</h3>
+                    <p style="color:#888;font-size:0.85rem">영상에서 구체적인 수치 조건이 언급되지 않았습니다. 위 전략 요약을 참고하여 직접 검색식을 구성해보세요.</p>
+                </div>`;
             }
 
             // 핵심 인사이트
@@ -383,7 +397,7 @@ async def read_index():
                 const data = await res.json();
                 lastAnalysis = data;
                 document.getElementById('analyze-result').innerHTML = renderAnalysis(data);
-                if (data.screen_filters) {
+                if (data.screen_filters && Object.keys(data.screen_filters).length > 0) {
                     document.getElementById('save-watchlist-section').style.display = 'block';
                     const tags = data.strategy_tags ? ` [${data.strategy_tags[0]}]` : '';
                     document.getElementById('wl-name').value = (data.strategy_summary?.substring(0, 25) || '새 검색식') + tags;
@@ -882,18 +896,26 @@ async def _parse_with_claude(transcript: str) -> dict:
     try:
         async with httpx.AsyncClient() as client:
             # Get the system prompt from the OpenAI path
-            system_prompt = """당신은 한국 주식 시장 전문 퀀트 애널리스트입니다. YouTube 투자 영상의 자막을 정밀하게 분석하여 **영상에서 실제로 언급된 구체적인 수치와 조건**을 추출하세요.
+            system_prompt = """당신은 한국 주식 시장 전문 퀀트 애널리스트입니다. YouTube 투자 영상의 자막에서 **화자가 실제로 말한 종목 스크리닝 조건**만 정확히 추출하세요.
 
-## 추출 규칙
+## 절대 규칙
+- **영상에서 명시적으로 언급한 수치와 조건만** screen_filters에 넣으세요
+- 영상에서 말하지 않은 조건을 **절대 추가하지 마세요**
+- 화자가 "PER 10배 이하인 종목"이라고 했으면 → {"per_lte": 10}
+- 화자가 구체적 수치 없이 "저평가 종목"이라고만 했으면 → screen_filters를 비워두고, strategy_summary에 설명
+- **추측, 유추, 일반적 기준값 삽입 금지**
+
+## 추출 항목
 1. **strategy_summary**: 영상의 핵심 투자 전략을 2-3문장으로 요약
-2. **mentioned_stocks**: 영상에서 직접 언급된 종목명 (추측하지 말 것)
-3. **screen_filters**: 영상에서 언급된 **구체적 재무 지표 조건**을 필터로 변환
-4. **strategy_tags**: 전략 유형 태그 (예: "가치투자", "모멘텀", "배당", "성장주", "턴어라운드" 등)
-5. **key_insights**: 영상의 핵심 인사이트 3-5개 (배열)
-6. **confidence**: 검색식의 신뢰도 (0.0~1.0)
+2. **mentioned_stocks**: 영상에서 직접 언급된 종목명만 (추측 금지)
+3. **screen_filters**: 영상에서 **화자가 직접 말한 수치 조건만** 필터로 변환. 언급 없으면 빈 객체 {}
+4. **filter_sources**: screen_filters의 각 항목이 영상의 어떤 발언에서 추출되었는지 원문 인용 (배열)
+5. **strategy_tags**: 전략 유형 태그
+6. **key_insights**: 영상의 핵심 인사이트 3-5개
+7. **confidence**: 검색식이 영상 내용을 정확히 반영하는 정도 (0.0~1.0). 조건이 명시적일수록 높음
 
 ## 사용 가능한 필터 키
-재무지표_조건 형식. 조건: lte(이하), gte(이상), lt(미만), gt(초과), eq(같음)
+재무지표_조건 형식. 조건: lte(이하), gte(이상), lt(미만), gt(초과)
 
 - per_lte, per_gte: PER (주가수익비율)
 - pbr_lte, pbr_gte: PBR (주가순자산비율)
@@ -901,20 +923,42 @@ async def _parse_with_claude(transcript: str) -> dict:
 - bps_gte: BPS (주당순자산)
 - div_gte: 배당수익률(%)
 - dps_gte: 주당배당금
-- roe_gte: ROE (자기자본이익률)
+- roe_gte, roe_lte: ROE (자기자본이익률)
 - roa_gte: ROA (총자산이익률)
-- debt_ratio_lte: 부채비율
-- market_cap_gte, market_cap_lte: 시가총액
-- revenue_growth_gte: 매출성장률
-- operating_margin_gte: 영업이익률
+- debt_ratio_lte: 부채비율(%)
+- market_cap_gte, market_cap_lte: 시가총액(원)
+- revenue_growth_gte: 매출성장률(%)
+- operating_margin_gte: 영업이익률(%)
 
-## 중요
-- 영상에서 **명시적으로 언급한 수치**를 우선 사용하세요
-- 수치가 언급되지 않았지만 전략에서 유추 가능한 경우, 합리적인 범위를 설정하고 confidence를 낮추세요
-- 가능한 한 **3개 이상의 필터 조건**을 생성하세요
-- 단순히 PER/ROE만 넣지 말고, 영상 내용에 맞는 다양한 지표를 활용하세요
+## 응답 예시
 
-반드시 JSON만 출력하세요. 다른 텍스트 없이 JSON 객체만 반환하세요."""
+영상에서 "PER 10배 이하이면서 ROE 15% 이상인 종목을 찾아라"라고 했다면:
+```json
+{
+  "strategy_summary": "저PER 고ROE 가치주 발굴 전략",
+  "mentioned_stocks": [],
+  "screen_filters": {"per_lte": 10, "roe_gte": 15},
+  "filter_sources": ["PER 10배 이하이면서 ROE 15% 이상인 종목을 찾아라"],
+  "strategy_tags": ["가치투자"],
+  "key_insights": ["PER과 ROE 두 지표를 결합한 스크리닝"],
+  "confidence": 0.95
+}
+```
+
+영상에서 구체적 수치 없이 "주도주를 매수하라"고만 했다면:
+```json
+{
+  "strategy_summary": "시장 주도주 중심 매수 전략",
+  "mentioned_stocks": ["삼성전자", "SK하이닉스"],
+  "screen_filters": {},
+  "filter_sources": [],
+  "strategy_tags": ["모멘텀"],
+  "key_insights": ["주도주 중심 포트폴리오 구성 권장"],
+  "confidence": 0.3
+}
+```
+
+반드시 JSON만 출력하세요."""
 
             resp = await client.post(
                 "https://api.anthropic.com/v1/messages",
