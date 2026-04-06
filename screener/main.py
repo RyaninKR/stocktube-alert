@@ -22,6 +22,7 @@ from shared.database import (
     get_pool, init_db,
     get_active_watchlists, get_today_alerted_tickers, save_alert,
 )
+from shared.kis_api import screen_stocks_kis, KIS_APP_KEY
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -229,14 +230,7 @@ async def run_screening():
 
         logger.info(f"Processing {len(watchlists)} active watchlists")
 
-        # 시장 데이터 가져오기
-        market = fetch_market_data()
-        if market["data"] is None:
-            logger.warning("No market data, aborting.")
-            return
-
-        today = market["date"]
-        df = market["data"]
+        today = datetime.now(KST).strftime("%Y%m%d")
 
         # 각 워치리스트 처리
         alerts_sent = 0
@@ -246,8 +240,23 @@ async def run_screening():
                 if isinstance(filters, str):
                     filters = json.loads(filters)
 
-                # 스크리닝
-                matched = apply_filters(df, filters)
+                # 스크리닝 - 한투 API 우선
+                matched = []
+                if KIS_APP_KEY:
+                    try:
+                        result = await screen_stocks_kis(filters)
+                        if "error" not in result and result.get("stocks"):
+                            matched = [{"ticker": s.get("ticker",""), "name": s.get("name",""), "data": s} for s in result["stocks"]]
+                            logger.info(f"KIS screening for '{wl['name']}': {len(matched)} matches")
+                    except Exception as e:
+                        logger.warning(f"KIS screening failed: {e}")
+
+                # Fallback: pykrx
+                if not matched:
+                    market = fetch_market_data()
+                    if market["data"] is not None:
+                        matched = apply_filters(market["data"], filters)
+
                 if not matched:
                     continue
 

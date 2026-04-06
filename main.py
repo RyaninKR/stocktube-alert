@@ -36,6 +36,8 @@ logger = logging.getLogger(__name__)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+KIS_APP_KEY = os.getenv("KIS_APP_KEY", "")
+KIS_APP_SECRET = os.getenv("KIS_APP_SECRET", "")
 WEBAPP_URL = os.getenv("WEBAPP_URL", "")
 
 # ─── DB Pool ───
@@ -691,6 +693,14 @@ async def parse_transcript(req: ParseRequest):
 @app.post("/api/screen")
 async def screen_stocks_api(req: ScreenRequest):
     try:
+        # 한투 API 우선, fallback으로 pykrx/KRX
+        if KIS_APP_KEY:
+            from shared.kis_api import screen_stocks_kis
+            result = await screen_stocks_kis(req.filters)
+            if "error" not in result:
+                return result
+            logger.warning(f"KIS screening failed, falling back: {result.get('error')}")
+
         result = await _screen_stocks(req.filters)
         return result
     except Exception as e:
@@ -875,6 +885,38 @@ async def send_telegram_notification(req: NotifyRequest):
     async with httpx.AsyncClient() as client:
         resp = await client.post(f"https://api.telegram.org/bot{bot_token}/sendMessage", json=payload)
         return resp.json()
+
+
+@app.get("/api/stock/{ticker}")
+async def get_stock_info(ticker: str):
+    """개별 종목 실시간 시세 + 재무 정보"""
+    if not KIS_APP_KEY:
+        return {"error": "KIS API not configured"}
+    from shared.kis_api import get_stock_detail
+    data = await get_stock_detail(ticker)
+    if not data:
+        return {"error": f"종목 {ticker} 정보를 가져올 수 없습니다"}
+    return data
+
+
+@app.get("/api/watchlist/{watchlist_id}/live")
+async def get_watchlist_live(watchlist_id: int):
+    """워치리스트 매칭 종목의 실시간 시세"""
+    if not KIS_APP_KEY:
+        return {"error": "KIS API not configured"}
+
+    wl = await get_watchlist(db_pool, watchlist_id)
+    if not wl:
+        return {"error": "워치리스트를 찾을 수 없습니다"}
+
+    from shared.kis_api import screen_stocks_kis
+    filters = wl["filters"]
+    if isinstance(filters, str):
+        filters = json.loads(filters)
+
+    result = await screen_stocks_kis(filters)
+    result["watchlist_name"] = wl["name"]
+    return result
 
 
 @app.post("/api/telegram/webhook")
