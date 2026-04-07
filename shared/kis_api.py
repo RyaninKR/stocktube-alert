@@ -251,20 +251,29 @@ async def _fetch_krx_direct(today_str: str) -> pd.DataFrame | None:
 
 
 async def _fetch_all_market_data() -> dict | None:
-    """pykrx → KRX 직접 API 순서로 전종목 데이터 조회"""
-    today_str = datetime.now(KST).strftime("%Y%m%d")
+    """pykrx → KRX 직접 API 순서로 전종목 데이터 조회. 당일 데이터 없으면 직전 거래일까지 시도."""
+    from datetime import timedelta as td
 
-    df = await _fetch_pykrx_data(today_str)
-    source = "pykrx"
+    today = datetime.now(KST).date()
 
-    if df is None or df.empty:
-        df = await _fetch_krx_direct(today_str)
-        source = "krx_direct"
+    # 최대 7일 전까지 시도 (주말/공휴일 대비)
+    for days_back in range(8):
+        target_date = today - td(days=days_back)
+        date_str = target_date.strftime("%Y%m%d")
 
-    if df is None or df.empty:
-        return None
+        df = await _fetch_pykrx_data(date_str)
+        source = "pykrx"
 
-    return {"date": today_str, "data": df, "source": source}
+        if df is None or df.empty:
+            df = await _fetch_krx_direct(date_str)
+            source = "krx_direct"
+
+        if df is not None and not df.empty:
+            if days_back > 0:
+                logger.info(f"Using data from {date_str} ({days_back} days ago)")
+            return {"date": date_str, "data": df, "source": source}
+
+    return None
 
 
 async def get_cached_market_data(max_age_sec: int = 300) -> dict | None:

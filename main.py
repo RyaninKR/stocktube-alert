@@ -97,6 +97,7 @@ class WatchlistUpdateRequest(BaseModel):
 
 class WebAuthRequest(BaseModel):
     chat_id: str
+    display_name: Optional[str] = None
 
 
 # ─── Telegram initData 검증 ───
@@ -521,10 +522,12 @@ async def read_index():
 @app.post("/api/auth/web")
 async def create_web_auth(req: WebAuthRequest):
     """웹 사용자 임시 인증 토큰 발급 (24시간 유효)"""
+    # users 테이블에 먼저 등록 (FK 제약 충족)
+    await upsert_user(db_pool, req.chat_id, req.display_name if hasattr(req, 'display_name') else None, None)
     token = str(uuid.uuid4())
     expires_at = datetime.utcnow() + timedelta(hours=24)
     await create_web_session(db_pool, req.chat_id, token, expires_at)
-    return {"token": token, "expires_at": expires_at.isoformat()}
+    return {"token": token, "chat_id": req.chat_id, "expires_at": expires_at.isoformat()}
 
 
 # ─── Telegram API ───
