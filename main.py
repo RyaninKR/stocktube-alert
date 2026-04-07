@@ -1,21 +1,23 @@
 """
-StockTube Alert MVP v0.5.0
+StockTube Alert MVP v0.6.0
 YouTube 투자 영상 → AI 검색식 자동 생성 → 실시간 종목 스크리닝
 웹앱 + 텔레그램 미니앱 동시 지원 + PostgreSQL + 워치리스트
++ 하이브리드 스크리닝, 워치리스트 인증, AI Retry
 """
 
 import os
 import json
 import hmac
+import uuid
 import hashlib
 import logging
 from urllib.parse import parse_qs, unquote
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 from contextlib import asynccontextmanager
 
 import httpx
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, Header, Depends
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
@@ -25,6 +27,7 @@ from shared.database import (
     get_notification_settings, update_notification_settings,
     create_watchlist, get_watchlists, get_watchlist,
     update_watchlist, delete_watchlist, get_alert_history,
+    create_web_session, get_web_session,
 )
 
 load_dotenv()
@@ -54,7 +57,7 @@ async def lifespan(app: FastAPI):
     await db_pool.close()
 
 
-app = FastAPI(title="StockTube Alert MVP", version="0.5.0", lifespan=lifespan)
+app = FastAPI(title="StockTube Alert MVP", version="0.6.0", lifespan=lifespan)
 
 
 # ─── Pydantic Models ───
@@ -92,6 +95,9 @@ class WatchlistUpdateRequest(BaseModel):
     filters: Optional[dict] = None
     is_active: Optional[bool] = None
 
+class WebAuthRequest(BaseModel):
+    chat_id: str
+
 
 # ─── Telegram initData 검증 ───
 def verify_telegram_init_data(init_data: str, bot_token: str) -> dict:
@@ -118,6 +124,39 @@ def verify_telegram_init_data(init_data: str, bot_token: str) -> dict:
     if user_data:
         return json.loads(unquote(user_data))
     return {}
+
+
+# ─── 인증 (#4) ───
+async def get_current_user(
+    x_telegram_init_data: Optional[str] = Header(None),
+    authorization: Optional[str] = Header(None),
+) -> str:
+    """텔레그램 initData 또는 Bearer 토큰으로 사용자 인증"""
+    if x_telegram_init_data:
+        try:
+            user = verify_telegram_init_data(x_telegram_init_data, TELEGRAM_BOT_TOKEN)
+            return str(user["id"])
+        except (ValueError, KeyError):
+            raise HTTPException(401, "텔레그램 인증 실패")
+
+    if authorization and authorization.startswith("Bearer "):
+        token = authorization[7:]
+        session = await get_web_session(db_pool, token)
+        if session:
+            return session["chat_id"]
+
+    raise HTTPException(401, "인증이 필요합니다")
+
+
+async def get_current_user_optional(
+    x_telegram_init_data: Optional[str] = Header(None),
+    authorization: Optional[str] = Header(None),
+) -> Optional[str]:
+    """인증 선택적 — 인증 실패 시 None 반환"""
+    try:
+        return await get_current_user(x_telegram_init_data, authorization)
+    except HTTPException:
+        return None
 
 
 # ─── HTML ───
@@ -257,6 +296,18 @@ async def read_index():
         const isTelegram = !!(tg && tg.initData);
         let chatId = null;
         let lastAnalysis = null;
+        let authToken = null;  // (#4) 웹 인증 토큰
+
+        // ─── 인증 헤더 생성 (#4) ───
+        function getAuthHeaders() {
+            const headers = {'Content-Type': 'application/json'};
+            if (isTelegram && tg.initData) {
+                headers['X-Telegram-Init-Data'] = tg.initData;
+            } else if (authToken) {
+                headers['Authorization'] = 'Bearer ' + authToken;
+            }
+            return headers;
+        }
 
         // ─── Init ───
         if (isTelegram) {
@@ -282,9 +333,24 @@ async def read_index():
             });
         } else {
             document.getElementById('register-banner').style.display = 'block';
-            // 웹에서는 localStorage로 임시 chat_id
+            // 웹: localStorage에서 토큰 복구 또는 새 세션 생성
             chatId = localStorage.getItem('st_chat_id') || 'web_' + Math.random().toString(36).substr(2, 9);
             localStorage.setItem('st_chat_id', chatId);
+            authToken = localStorage.getItem('st_auth_token');
+
+            // 웹 세션 토큰이 없으면 발급
+            if (!authToken) {
+                fetch('/api/auth/web', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({chat_id: chatId})
+                }).then(r => r.json()).then(d => {
+                    if (d.token) {
+                        authToken = d.token;
+                        localStorage.setItem('st_auth_token', d.token);
+                    }
+                }).catch(() => {});
+            }
         }
 
         // ─── Tabs ───
@@ -312,77 +378,49 @@ async def read_index():
         }
 
         function renderAnalysis(data) {
-            if (data.error) return `<div class="analysis-card"><h3>⚠️ 오류</h3><p>${data.error}</p></div>`;
+            if (data.error) return '<div class="analysis-card"><h3>⚠️ 오류</h3><p>' + data.error + '</p></div>';
 
             let html = '';
 
-            // 전략 요약
-            html += `<div class="analysis-card">
-                <h3>📌 전략 요약</h3>
-                <p style="font-size:0.9rem;line-height:1.5">${data.strategy_summary || 'N/A'}</p>`;
+            html += '<div class="analysis-card"><h3>📌 전략 요약</h3><p style="font-size:0.9rem;line-height:1.5">' + (data.strategy_summary || 'N/A') + '</p>';
             if (data.strategy_tags?.length) {
-                html += `<div style="margin-top:8px">${data.strategy_tags.map(t => `<span class="tag">${t}</span>`).join('')}</div>`;
+                html += '<div style="margin-top:8px">' + data.strategy_tags.map(t => '<span class="tag">' + t + '</span>').join('') + '</div>';
             }
-            html += `</div>`;
+            html += '</div>';
 
-            // 언급 종목
             if (data.mentioned_stocks?.length) {
-                html += `<div class="analysis-card">
-                    <h3>📊 언급 종목</h3>
-                    <div>${data.mentioned_stocks.map(s => `<span class="stock-chip">${s}</span>`).join('')}</div>
-                </div>`;
+                html += '<div class="analysis-card"><h3>📊 언급 종목</h3><div>' + data.mentioned_stocks.map(s => '<span class="stock-chip">' + s + '</span>').join('') + '</div></div>';
             }
 
-            // 검색식 (핵심!)
             if (data.screen_filters && Object.keys(data.screen_filters).length > 0) {
                 const entries = Object.entries(data.screen_filters);
-                html += `<div class="analysis-card">
-                    <h3>🔍 스크리닝 검색식 <span style="font-size:0.75rem;color:#888">(${entries.length}개 조건)</span></h3>
-                    <div class="filter-grid">`;
+                html += '<div class="analysis-card"><h3>🔍 스크리닝 검색식 <span style="font-size:0.75rem;color:#888">(' + entries.length + '개 조건)</span></h3><div class="filter-grid">';
                 for (const [k, v] of entries) {
                     const parts = k.split('_');
                     const op = parts.pop();
                     const col = parts.join('_');
-                    html += `<div class="filter-chip">
-                        <div class="filter-label">${filterLabels[col] || col.toUpperCase()}</div>
-                        <div class="filter-value">${opSymbols[op]||op} ${formatValue(col, v)}</div>
-                        <div class="filter-op">${opLabels[op]||op}</div>
-                    </div>`;
+                    html += '<div class="filter-chip"><div class="filter-label">' + (filterLabels[col] || col.toUpperCase()) + '</div><div class="filter-value">' + (opSymbols[op]||op) + ' ' + formatValue(col, v) + '</div><div class="filter-op">' + (opLabels[op]||op) + '</div></div>';
                 }
-                html += `</div>`;
-                // filter_sources (원문 인용)
+                html += '</div>';
                 if (data.filter_sources?.length) {
-                    html += `<div style="margin-top:10px;padding:8px;background:#f0f7ff;border-radius:6px;font-size:0.8rem;color:#555">`;
-                    html += `<b>📝 영상 원문:</b><br>`;
-                    data.filter_sources.forEach(s => { html += `<i>"${s}"</i><br>`; });
-                    html += `</div>`;
+                    html += '<div style="margin-top:10px;padding:8px;background:#f0f7ff;border-radius:6px;font-size:0.8rem;color:#555"><b>📝 영상 원문:</b><br>';
+                    data.filter_sources.forEach(s => { html += '<i>"' + s + '"</i><br>'; });
+                    html += '</div>';
                 }
-                html += `</div>`;
+                html += '</div>';
             } else {
-                // screen_filters가 비어있으면
-                html += `<div class="analysis-card">
-                    <h3>🔍 스크리닝 검색식</h3>
-                    <p style="color:#888;font-size:0.85rem">영상에서 구체적인 수치 조건이 언급되지 않았습니다. 위 전략 요약을 참고하여 직접 검색식을 구성해보세요.</p>
-                </div>`;
+                html += '<div class="analysis-card"><h3>🔍 스크리닝 검색식</h3><p style="color:#888;font-size:0.85rem">영상에서 구체적인 수치 조건이 언급되지 않았습니다. 위 전략 요약을 참고하여 직접 검색식을 구성해보세요.</p></div>';
             }
 
-            // 핵심 인사이트
             if (data.key_insights?.length) {
-                html += `<div class="analysis-card">
-                    <h3>💡 핵심 인사이트</h3>`;
-                data.key_insights.forEach(i => {
-                    html += `<div class="insight-item"><span>•</span><span>${i}</span></div>`;
-                });
-                html += `</div>`;
+                html += '<div class="analysis-card"><h3>💡 핵심 인사이트</h3>';
+                data.key_insights.forEach(i => { html += '<div class="insight-item"><span>•</span><span>' + i + '</span></div>'; });
+                html += '</div>';
             }
 
-            // 신뢰도
             const conf = Math.round((data.confidence || 0) * 100);
             const confClass = conf >= 70 ? 'conf-high' : conf >= 40 ? 'conf-mid' : 'conf-low';
-            html += `<div class="analysis-card">
-                <h3>📈 분석 신뢰도 <span style="font-weight:700;color:var(--primary)">${conf}%</span></h3>
-                <div class="confidence-bar"><div class="confidence-fill ${confClass}" style="width:${conf}%"></div></div>
-            </div>`;
+            html += '<div class="analysis-card"><h3>📈 분석 신뢰도 <span style="font-weight:700;color:var(--primary)">' + conf + '%</span></h3><div class="confidence-bar"><div class="confidence-fill ' + confClass + '" style="width:' + conf + '%"></div></div></div>';
 
             return html;
         }
@@ -395,17 +433,17 @@ async def read_index():
             document.getElementById('analyze-result').innerHTML = '';
             document.getElementById('save-watchlist-section').style.display = 'none';
             try {
-                const res = await fetch('/api/analyze', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({youtube_url:url})});
+                const res = await fetch('/api/analyze', {method:'POST', headers: getAuthHeaders(), body: JSON.stringify({youtube_url:url})});
                 const data = await res.json();
                 lastAnalysis = data;
                 document.getElementById('analyze-result').innerHTML = renderAnalysis(data);
                 if (data.screen_filters && Object.keys(data.screen_filters).length > 0) {
                     document.getElementById('save-watchlist-section').style.display = 'block';
-                    const tags = data.strategy_tags ? ` [${data.strategy_tags[0]}]` : '';
+                    const tags = data.strategy_tags ? ' [' + data.strategy_tags[0] + ']' : '';
                     document.getElementById('wl-name').value = (data.strategy_summary?.substring(0, 25) || '새 검색식') + tags;
                     document.getElementById('screen-filters').value = JSON.stringify(data.screen_filters);
                 }
-            } catch(e) { document.getElementById('analyze-result').innerHTML = `<div class="analysis-card"><h3>⚠️ 오류</h3><p>${e.message}</p></div>`; }
+            } catch(e) { document.getElementById('analyze-result').innerHTML = '<div class="analysis-card"><h3>⚠️ 오류</h3><p>' + e.message + '</p></div>'; }
             finally { btn.disabled = false; btn.textContent = '분석 시작'; }
         }
 
@@ -415,7 +453,7 @@ async def read_index():
             let filters = {};
             try { if (s) filters = JSON.parse(s); } catch { return alert('올바른 JSON 형식'); }
             try {
-                const res = await fetch('/api/screen', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({filters})});
+                const res = await fetch('/api/screen', {method:'POST', headers: getAuthHeaders(), body:JSON.stringify({filters})});
                 document.getElementById('screen-result').textContent = JSON.stringify(await res.json(), null, 2);
             } catch(e) { document.getElementById('screen-result').textContent = '오류: ' + e.message; }
         }
@@ -427,7 +465,7 @@ async def read_index():
             const filters = lastAnalysis?.screen_filters || {};
             const sourceUrl = document.getElementById('youtube-url').value;
             try {
-                const res = await fetch('/api/watchlist', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({chat_id:chatId, name, filters, source_video_url:sourceUrl})});
+                const res = await fetch('/api/watchlist', {method:'POST', headers: getAuthHeaders(), body:JSON.stringify({chat_id:chatId, name, filters, source_video_url:sourceUrl})});
                 const data = await res.json();
                 if (data.id) { alert('워치리스트에 추가됐습니다!'); document.getElementById('save-watchlist-section').style.display = 'none'; }
                 else alert('저장 실패: ' + JSON.stringify(data));
@@ -437,40 +475,37 @@ async def read_index():
         async function loadWatchlists() {
             if (!chatId) return;
             try {
-                const res = await fetch('/api/watchlist/' + chatId);
+                // (#4) 인증된 사용자 워치리스트 - /api/watchlist/me 우선, fallback으로 기존 API
+                let res;
+                const headers = getAuthHeaders();
+                try {
+                    res = await fetch('/api/watchlist/me', {headers});
+                    if (!res.ok) throw new Error('auth failed');
+                } catch {
+                    res = await fetch('/api/watchlist/' + chatId);
+                }
                 const data = await res.json();
                 const container = document.getElementById('watchlist-container');
                 if (!data.watchlists?.length) { container.innerHTML = '<div class="empty">워치리스트가 없습니다.<br>영상 분석 후 검색식을 등록하세요!</div>'; return; }
-                container.innerHTML = data.watchlists.map(w => `
-                    <div class="wl-item">
-                        <div class="wl-info">
-                            <div class="wl-name">${w.name} <span class="badge ${w.is_active?'badge-on':'badge-off'}">${w.is_active?'활성':'비활성'}</span></div>
-                            <div class="wl-filters">${JSON.stringify(w.filters)}</div>
-                        </div>
-                        <div class="wl-actions">
-                            <button class="btn btn-sm ${w.is_active?'btn-danger':'btn-success'}" onclick="toggleWatchlist(${w.id},${!w.is_active})">${w.is_active?'OFF':'ON'}</button>
-                            <button class="btn btn-sm btn-danger" onclick="deleteWatchlist(${w.id})">삭제</button>
-                        </div>
-                    </div>
-                `).join('');
+                container.innerHTML = data.watchlists.map(w => '<div class="wl-item"><div class="wl-info"><div class="wl-name">' + w.name + ' <span class="badge ' + (w.is_active?'badge-on':'badge-off') + '">' + (w.is_active?'활성':'비활성') + '</span></div><div class="wl-filters">' + JSON.stringify(w.filters) + '</div></div><div class="wl-actions"><button class="btn btn-sm ' + (w.is_active?'btn-danger':'btn-success') + '" onclick="toggleWatchlist(' + w.id + ',' + !w.is_active + ')">' + (w.is_active?'OFF':'ON') + '</button><button class="btn btn-sm btn-danger" onclick="deleteWatchlist(' + w.id + ')">삭제</button></div></div>').join('');
             } catch(e) { console.error(e); }
         }
 
         async function toggleWatchlist(id, active) {
-            await fetch('/api/watchlist/' + id, {method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify({is_active:active})});
+            await fetch('/api/watchlist/' + id, {method:'PUT', headers: getAuthHeaders(), body:JSON.stringify({is_active:active})});
             loadWatchlists();
         }
 
         async function deleteWatchlist(id) {
             if (!confirm('삭제하시겠습니까?')) return;
-            await fetch('/api/watchlist/' + id, {method:'DELETE'});
+            await fetch('/api/watchlist/' + id, {method:'DELETE', headers: getAuthHeaders()});
             loadWatchlists();
         }
 
         // ─── Settings ───
         async function saveSettings() {
             if (!isTelegram || !chatId) return;
-            await fetch('/api/telegram/settings', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({
+            await fetch('/api/telegram/settings', {method:'POST', headers: getAuthHeaders(), body:JSON.stringify({
                 chat_id: chatId,
                 notify_on_match: document.getElementById('notify-match').checked,
                 notify_on_analyze: document.getElementById('notify-analyze').checked,
@@ -480,6 +515,16 @@ async def read_index():
     </script>
 </body>
 </html>"""
+
+
+# ─── Auth API (#4) ───
+@app.post("/api/auth/web")
+async def create_web_auth(req: WebAuthRequest):
+    """웹 사용자 임시 인증 토큰 발급 (24시간 유효)"""
+    token = str(uuid.uuid4())
+    expires_at = datetime.utcnow() + timedelta(hours=24)
+    await create_web_session(db_pool, req.chat_id, token, expires_at)
+    return {"token": token, "expires_at": expires_at.isoformat()}
 
 
 # ─── Telegram API ───
@@ -519,17 +564,33 @@ async def get_settings(chat_id: str):
     return {"settings": settings}
 
 
-# ─── Watchlist API ───
+# ─── Watchlist API (#4 인증 추가) ───
 @app.post("/api/watchlist")
 async def create_watchlist_api(req: WatchlistCreateRequest):
     wl_id = await create_watchlist(db_pool, req.chat_id, req.name, req.filters, req.source_video_url)
     return {"id": wl_id, "status": "created"}
 
 
+@app.get("/api/watchlist/me")
+async def get_my_watchlists(user_id: str = Depends(get_current_user)):
+    """인증된 사용자의 워치리스트 (#4)"""
+    watchlists = await get_watchlists(db_pool, user_id)
+    result = []
+    for w in watchlists:
+        item = {**w}
+        if isinstance(item.get("filters"), str):
+            item["filters"] = json.loads(item["filters"])
+        for k in ("created_at", "updated_at"):
+            if item.get(k):
+                item[k] = item[k].isoformat()
+        result.append(item)
+    return {"watchlists": result}
+
+
 @app.get("/api/watchlist/{chat_id}")
 async def get_watchlists_api(chat_id: str):
+    logger.warning(f"Deprecated: GET /api/watchlist/{{chat_id}} called for {chat_id}. Use /api/watchlist/me instead.")
     watchlists = await get_watchlists(db_pool, chat_id)
-    # Convert filters from string to dict if needed, and serialize dates
     result = []
     for w in watchlists:
         item = {**w}
@@ -543,13 +604,30 @@ async def get_watchlists_api(chat_id: str):
 
 
 @app.put("/api/watchlist/{watchlist_id}")
-async def update_watchlist_api(watchlist_id: int, req: WatchlistUpdateRequest):
+async def update_watchlist_api(
+    watchlist_id: int,
+    req: WatchlistUpdateRequest,
+    user_id: Optional[str] = Depends(get_current_user_optional),
+):
+    # (#4) 소유권 검증
+    if user_id:
+        wl = await get_watchlist(db_pool, watchlist_id)
+        if wl and wl["chat_id"] != user_id:
+            raise HTTPException(403, "이 워치리스트의 소유자가 아닙니다")
     await update_watchlist(db_pool, watchlist_id, req.name, req.filters, req.is_active)
     return {"status": "updated"}
 
 
 @app.delete("/api/watchlist/{watchlist_id}")
-async def delete_watchlist_api(watchlist_id: int):
+async def delete_watchlist_api(
+    watchlist_id: int,
+    user_id: Optional[str] = Depends(get_current_user_optional),
+):
+    # (#4) 소유권 검증
+    if user_id:
+        wl = await get_watchlist(db_pool, watchlist_id)
+        if wl and wl["chat_id"] != user_id:
+            raise HTTPException(403, "이 워치리스트의 소유자가 아닙니다")
     await delete_watchlist(db_pool, watchlist_id)
     return {"status": "deleted"}
 
@@ -588,7 +666,7 @@ async def analyze_video(req: AnalyzeUrlRequest):
     transcript_text = None
     extraction_method = None
 
-    # 방법 1: yt-dlp로 자막 추출 (클라우드 IP 우회 가능)
+    # 방법 1: yt-dlp로 자막 추출
     try:
         result = subprocess.run(
             ["yt-dlp", "--skip-download", "--write-auto-sub", "--write-sub",
@@ -598,13 +676,11 @@ async def analyze_video(req: AnalyzeUrlRequest):
             cwd=tempfile.gettempdir()
         )
 
-        # 자막 파일 찾기
         import glob
         sub_files = glob.glob(f"{tempfile.gettempdir()}/{video_id}*.json3")
         if sub_files:
             with open(sub_files[0], 'r') as f:
                 sub_data = json.load(f)
-            # json3 형식에서 텍스트 추출
             segments = sub_data.get("events", [])
             texts = []
             for seg in segments:
@@ -615,12 +691,10 @@ async def analyze_video(req: AnalyzeUrlRequest):
                         texts.append(t)
             transcript_text = " ".join(texts)
             extraction_method = "yt-dlp"
-            # 임시 파일 정리
             for f in sub_files:
                 os.remove(f)
 
         if not transcript_text:
-            # yt-dlp로 자막 파일이 없는 경우 - vtt 시도
             result2 = subprocess.run(
                 ["yt-dlp", "--skip-download", "--write-auto-sub", "--write-sub",
                  "--sub-lang", "ko,en", "--sub-format", "vtt",
@@ -632,13 +706,11 @@ async def analyze_video(req: AnalyzeUrlRequest):
             if vtt_files:
                 with open(vtt_files[0], 'r') as f:
                     vtt_content = f.read()
-                # VTT에서 텍스트만 추출
                 lines = []
                 for line in vtt_content.split('\n'):
                     line = line.strip()
                     if not line or '-->' in line or line.startswith('WEBVTT') or line.startswith('Kind:') or line.startswith('Language:') or re.match(r'^\d+$', line):
                         continue
-                    # HTML 태그 제거
                     clean = re.sub(r'<[^>]+>', '', line)
                     if clean:
                         lines.append(clean)
@@ -668,7 +740,7 @@ async def analyze_video(req: AnalyzeUrlRequest):
     if not transcript_text or len(transcript_text.strip()) < 50:
         return {"error": "자막을 찾을 수 없거나 내용이 너무 짧습니다. 자막이 있는 영상인지 확인해주세요."}
 
-    # 중복 텍스트 제거 (자동자막 특성)
+    # 중복 텍스트 제거
     words = transcript_text.split()
     deduped = [words[0]] if words else []
     for w in words[1:]:
@@ -692,184 +764,14 @@ async def parse_transcript(req: ParseRequest):
 
 @app.post("/api/screen")
 async def screen_stocks_api(req: ScreenRequest):
+    """종목 스크리닝 — 하이브리드 방식 (#1)"""
     try:
-        # 한투 API 우선, fallback으로 pykrx/KRX
-        if KIS_APP_KEY:
-            from shared.kis_api import screen_stocks_kis
-            result = await screen_stocks_kis(req.filters)
-            if "error" not in result:
-                return result
-            logger.warning(f"KIS screening failed, falling back: {result.get('error')}")
-
-        result = await _screen_stocks(req.filters)
+        from shared.kis_api import screen_stocks_hybrid
+        result = await screen_stocks_hybrid(req.filters)
         return result
     except Exception as e:
         logger.error(f"Screen error: {e}")
         return {"error": str(e)}
-
-
-async def _screen_stocks(filters: dict) -> dict:
-    """KRX 데이터로 종목 스크리닝 (pykrx fallback 포함)"""
-    import pandas as pd
-
-    df = None
-    today = datetime.now().strftime("%Y%m%d")
-    source = "unknown"
-
-    # 방법 1: pykrx
-    try:
-        from pykrx import stock
-        df = stock.get_market_fundamental(today, market="ALL")
-        if df is not None and not df.empty:
-            source = "pykrx"
-    except Exception as e:
-        logger.warning(f"pykrx failed: {e}")
-
-    # 방법 2: KRX 직접 API
-    if df is None or df.empty:
-        try:
-            df, today = await _fetch_krx_direct(today)
-            if df is not None and not df.empty:
-                source = "krx_direct"
-        except Exception as e:
-            logger.warning(f"KRX direct failed: {e}")
-
-    if df is None or df.empty:
-        return {"error": "시장 데이터를 가져올 수 없습니다. 장 운영 시간을 확인해주세요.", "date": today}
-
-    # 필터 적용
-    results = df.copy()
-    applied_filters = []
-    for key, value in filters.items():
-        parts = key.rsplit("_", 1)
-        if len(parts) != 2:
-            continue
-        col, op = parts
-        col_upper = col.upper()
-        # 컬럼명 매칭 (대소문자 무시)
-        matched_col = None
-        for c in results.columns:
-            if c.upper() == col_upper:
-                matched_col = c
-                break
-        if matched_col is None:
-            continue
-
-        try:
-            if op == "lte":
-                results = results[(results[matched_col] <= value) & (results[matched_col] > 0)]
-            elif op == "gte":
-                results = results[results[matched_col] >= value]
-            elif op == "eq":
-                results = results[results[matched_col] == value]
-            elif op == "lt":
-                results = results[(results[matched_col] < value) & (results[matched_col] > 0)]
-            elif op == "gt":
-                results = results[results[matched_col] > value]
-            applied_filters.append(f"{matched_col} {op} {value}")
-        except Exception as e:
-            logger.warning(f"Filter {key}={value} error: {e}")
-
-    # 종목명 추가
-    tickers = results.index.tolist()[:50]
-    if source == "pykrx":
-        try:
-            from pykrx import stock
-            names = {t: stock.get_market_ticker_name(t) for t in tickers}
-        except:
-            names = {}
-    else:
-        names = {}
-
-    results = results.head(50)
-    if "종목명" not in results.columns and names:
-        results = results.copy()
-        results["종목명"] = results.index.map(lambda x: names.get(x, ""))
-
-    stocks = []
-    for idx, row in results.iterrows():
-        stock_data = {"ticker": idx}
-        for col in results.columns:
-            val = row[col]
-            if hasattr(val, 'item'):
-                val = val.item()
-            stock_data[col] = val
-        stocks.append(stock_data)
-
-    return {
-        "count": len(stocks),
-        "date": today,
-        "source": source,
-        "filters_applied": applied_filters,
-        "stocks": stocks,
-    }
-
-
-async def _fetch_krx_direct(date: str):
-    """KRX API 직접 호출 (pykrx 우회)"""
-    import pandas as pd
-
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Referer': 'http://data.krx.co.kr/contents/MDC/MDI/mdiLoader/index.cmd?menuId=MDC0201020101'
-    }
-    params = {
-        'bld': 'dbms/MDC/STAT/standard/MDCSTAT03501',
-        'locale': 'ko_KR',
-        'searchType': '1',
-        'mktId': 'ALL',
-        'trdDd': date,
-    }
-
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(
-            'http://data.krx.co.kr/comm/bldAttendant/getJsonData.cmd',
-            data=params,
-            headers=headers,
-            timeout=15,
-        )
-        data = resp.json()
-
-    if 'output' not in data or not data['output']:
-        return None, date
-
-    records = data['output']
-    df = pd.DataFrame(records)
-
-    # 컬럼 정리 - KRX 응답 컬럼명을 표준화
-    col_map = {}
-    for col in df.columns:
-        upper = col.upper()
-        if 'PER' in upper and 'BPS' not in upper:
-            col_map[col] = 'PER'
-        elif 'PBR' in upper:
-            col_map[col] = 'PBR'
-        elif 'EPS' in upper:
-            col_map[col] = 'EPS'
-        elif 'BPS' in upper:
-            col_map[col] = 'BPS'
-        elif 'DIV' in upper or '배당' in col:
-            col_map[col] = 'DIV'
-        elif 'DPS' in upper:
-            col_map[col] = 'DPS'
-        elif '종목코드' in col or 'ISU_SRT_CD' in col:
-            col_map[col] = 'ticker'
-        elif '종목명' in col or 'ISU_ABBRV' in col:
-            col_map[col] = '종목명'
-
-    if col_map:
-        df = df.rename(columns=col_map)
-
-    # ticker를 인덱스로
-    if 'ticker' in df.columns:
-        df = df.set_index('ticker')
-
-    # 숫자 변환
-    for col in ['PER', 'PBR', 'EPS', 'BPS', 'DIV', 'DPS']:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col].astype(str).str.replace(',', ''), errors='coerce')
-
-    return df, date
 
 
 @app.post("/api/notify")
@@ -909,12 +811,12 @@ async def get_watchlist_live(watchlist_id: int):
     if not wl:
         return {"error": "워치리스트를 찾을 수 없습니다"}
 
-    from shared.kis_api import screen_stocks_kis
+    from shared.kis_api import screen_stocks_hybrid
     filters = wl["filters"]
     if isinstance(filters, str):
         filters = json.loads(filters)
 
-    result = await screen_stocks_kis(filters)
+    result = await screen_stocks_hybrid(filters)
     result["watchlist_name"] = wl["name"]
     return result
 
@@ -955,56 +857,7 @@ async def _parse_with_ai(transcript: str) -> dict:
         response = await client.chat.completions.create(
             model="gpt-4o",
             messages=[
-                {"role": "system", "content": """당신은 한국 주식 시장 전문 퀀트 애널리스트입니다. YouTube 투자 영상의 자막을 정밀하게 분석하여 **영상에서 실제로 언급된 구체적인 수치와 조건**을 추출하세요.
-
-## 추출 규칙
-1. **strategy_summary**: 영상의 핵심 투자 전략을 2-3문장으로 요약
-2. **mentioned_stocks**: 영상에서 직접 언급된 종목명 (추측하지 말 것)
-3. **screen_filters**: 영상에서 언급된 **구체적 재무 지표 조건**을 필터로 변환
-4. **strategy_tags**: 전략 유형 태그 (예: "가치투자", "모멘텀", "배당", "성장주", "턴어라운드" 등)
-5. **key_insights**: 영상의 핵심 인사이트 3-5개 (배열)
-6. **confidence**: 검색식의 신뢰도 (0.0~1.0)
-
-## 사용 가능한 필터 키
-재무지표_조건 형식. 조건: lte(이하), gte(이상), lt(미만), gt(초과), eq(같음)
-
-- per_lte, per_gte: PER (주가수익비율)
-- pbr_lte, pbr_gte: PBR (주가순자산비율)  
-- eps_gte: EPS (주당순이익)
-- bps_gte: BPS (주당순자산)
-- div_gte: 배당수익률(%)
-- dps_gte: 주당배당금
-- roe_gte: ROE (자기자본이익률)
-- roa_gte: ROA (총자산이익률)
-- debt_ratio_lte: 부채비율
-- market_cap_gte, market_cap_lte: 시가총액
-- revenue_growth_gte: 매출성장률
-- operating_margin_gte: 영업이익률
-
-## 중요
-- 영상에서 **명시적으로 언급한 수치**를 우선 사용하세요
-- 수치가 언급되지 않았지만 전략에서 유추 가능한 경우, 합리적인 범위를 설정하고 confidence를 낮추세요
-- 가능한 한 **3개 이상의 필터 조건**을 생성하세요
-- 단순히 PER/ROE만 넣지 말고, 영상 내용에 맞는 다양한 지표를 활용하세요
-
-## 응답 형식 (JSON)
-{
-  "strategy_summary": "구체적 전략 요약",
-  "mentioned_stocks": ["삼성전자", "SK하이닉스"],
-  "screen_filters": {
-    "per_lte": 15,
-    "pbr_lte": 1.5,
-    "roe_gte": 10,
-    "div_gte": 2.0,
-    "eps_gte": 1000
-  },
-  "strategy_tags": ["가치투자", "배당"],
-  "key_insights": [
-    "현재 시장은 가치주 중심으로 재편 중",
-    "PER 15 이하 종목 중 배당수익률 2% 이상이 유망"
-  ],
-  "confidence": 0.75
-}"""},
+                {"role": "system", "content": _get_ai_system_prompt()},
                 {"role": "user", "content": f"다음 YouTube 투자 영상 자막을 분석하여 종목 스크리닝 검색식을 생성해주세요. 영상에서 언급된 구체적 수치와 조건을 최대한 반영하세요:\n\n{transcript[:6000]}"}
             ],
             response_format={"type": "json_object"},
@@ -1014,12 +867,8 @@ async def _parse_with_ai(transcript: str) -> dict:
         return {"error": f"AI parsing failed: {str(e)}"}
 
 
-async def _parse_with_claude(transcript: str) -> dict:
-    """Claude 4.6 Sonnet으로 투자 전략 파싱"""
-    try:
-        async with httpx.AsyncClient() as client:
-            # Get the system prompt from the OpenAI path
-            system_prompt = """당신은 한국 주식 시장 전문 퀀트 애널리스트입니다. YouTube 투자 영상의 자막에서 **화자가 실제로 말한 종목 스크리닝 조건**만 정확히 추출하세요.
+def _get_ai_system_prompt() -> str:
+    return """당신은 한국 주식 시장 전문 퀀트 애널리스트입니다. YouTube 투자 영상의 자막에서 **화자가 실제로 말한 종목 스크리닝 조건**만 정확히 추출하세요.
 
 ## 절대 규칙
 - **영상에서 명시적으로 언급한 수치와 조건만** screen_filters에 넣으세요
@@ -1053,68 +902,76 @@ async def _parse_with_claude(transcript: str) -> dict:
 - revenue_growth_gte: 매출성장률(%)
 - operating_margin_gte: 영업이익률(%)
 
-## 응답 예시
-
-영상에서 "PER 10배 이하이면서 ROE 15% 이상인 종목을 찾아라"라고 했다면:
-```json
-{
-  "strategy_summary": "저PER 고ROE 가치주 발굴 전략",
-  "mentioned_stocks": [],
-  "screen_filters": {"per_lte": 10, "roe_gte": 15},
-  "filter_sources": ["PER 10배 이하이면서 ROE 15% 이상인 종목을 찾아라"],
-  "strategy_tags": ["가치투자"],
-  "key_insights": ["PER과 ROE 두 지표를 결합한 스크리닝"],
-  "confidence": 0.95
-}
-```
-
-영상에서 구체적 수치 없이 "주도주를 매수하라"고만 했다면:
-```json
-{
-  "strategy_summary": "시장 주도주 중심 매수 전략",
-  "mentioned_stocks": ["삼성전자", "SK하이닉스"],
-  "screen_filters": {},
-  "filter_sources": [],
-  "strategy_tags": ["모멘텀"],
-  "key_insights": ["주도주 중심 포트폴리오 구성 권장"],
-  "confidence": 0.3
-}
-```
-
 반드시 JSON만 출력하세요."""
 
-            resp = await client.post(
-                "https://api.anthropic.com/v1/messages",
-                headers={
-                    "x-api-key": ANTHROPIC_API_KEY,
-                    "anthropic-version": "2023-06-01",
-                    "content-type": "application/json",
-                },
-                json={
-                    "model": "claude-sonnet-4-20250514",
-                    "max_tokens": 2048,
-                    "system": system_prompt,
-                    "messages": [
-                        {"role": "user", "content": f"다음 YouTube 투자 영상 자막을 분석하여 종목 스크리닝 검색식을 생성해주세요. 영상에서 언급된 구체적 수치와 조건을 최대한 반영하세요:\n\n{transcript[:8000]}"}
-                    ],
-                },
-                timeout=60,
-            )
 
-            data = resp.json()
-            content = data["content"][0]["text"]
+async def _parse_with_claude(transcript: str, max_retries: int = 2) -> dict:
+    """Claude로 투자 전략 파싱 (#5-B retry 로직 포함)"""
+    system_prompt = _get_ai_system_prompt()
+    content = ""
 
-            # JSON 추출 (```json ... ``` 감싸진 경우 처리)
-            if "```json" in content:
-                content = content.split("```json")[1].split("```")[0]
-            elif "```" in content:
-                content = content.split("```")[1].split("```")[0]
+    for attempt in range(max_retries + 1):
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.post(
+                    "https://api.anthropic.com/v1/messages",
+                    headers={
+                        "x-api-key": ANTHROPIC_API_KEY,
+                        "anthropic-version": "2023-06-01",
+                        "content-type": "application/json",
+                    },
+                    json={
+                        "model": "claude-sonnet-4-20250514",
+                        "max_tokens": 2048,
+                        "system": system_prompt,
+                        "messages": [
+                            {"role": "user", "content": f"다음 YouTube 투자 영상 자막을 분석하여 종목 스크리닝 검색식을 생성해주세요. 영상에서 언급된 구체적 수치와 조건을 최대한 반영하세요:\n\n{transcript[:8000]}"}
+                        ],
+                    },
+                    timeout=60,
+                )
 
-            return json.loads(content.strip())
+                data = resp.json()
+                content = data["content"][0]["text"]
 
-    except Exception as e:
-        logger.error(f"Claude parsing failed: {e}")
-        return {"error": f"Claude parsing failed: {str(e)}"}
+                # JSON 추출
+                if "```json" in content:
+                    content = content.split("```json")[1].split("```")[0]
+                elif "```" in content:
+                    content = content.split("```")[1].split("```")[0]
+
+                result = json.loads(content.strip())
+
+                # 필수 필드 검증
+                required = ["strategy_summary", "screen_filters", "confidence"]
+                if all(k in result for k in required):
+                    return result
+
+                # 필수 필드 누락 — retry
+                if attempt < max_retries:
+                    logger.warning(f"Claude response missing required fields (attempt {attempt + 1})")
+                    continue
+                return result
+
+        except json.JSONDecodeError:
+            if attempt < max_retries:
+                logger.warning(f"Claude JSON parse error (attempt {attempt + 1})")
+                continue
+            return {"error": "AI 응답 파싱 실패", "raw": content[:500]}
+
+        except httpx.TimeoutException:
+            if attempt < max_retries:
+                logger.warning(f"Claude timeout (attempt {attempt + 1})")
+                continue
+            return {"error": "AI 응답 시간 초과"}
+
+        except Exception as e:
+            logger.error(f"Claude parsing failed: {e}")
+            if attempt < max_retries:
+                continue
+            return {"error": f"Claude parsing failed: {str(e)}"}
+
+    return {"error": "AI 응답 처리 실패"}
 
 
 if __name__ == "__main__":

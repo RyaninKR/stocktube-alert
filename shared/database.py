@@ -4,7 +4,9 @@ web 서비스와 screener 서비스가 함께 사용
 """
 
 import os
+import json
 import logging
+from datetime import date
 from contextlib import asynccontextmanager
 
 import asyncpg
@@ -54,9 +56,17 @@ CREATE TABLE IF NOT EXISTS notification_settings (
     updated_at TIMESTAMP DEFAULT NOW()
 );
 
+CREATE TABLE IF NOT EXISTS web_sessions (
+    token VARCHAR PRIMARY KEY,
+    chat_id VARCHAR NOT NULL,
+    created_at TIMESTAMP DEFAULT NOW(),
+    expires_at TIMESTAMP NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_watchlists_chat_id ON watchlists(chat_id);
 CREATE INDEX IF NOT EXISTS idx_watchlists_active ON watchlists(is_active) WHERE is_active = TRUE;
 CREATE INDEX IF NOT EXISTS idx_alert_history_watchlist ON alert_history(watchlist_id, matched_at);
+CREATE INDEX IF NOT EXISTS idx_web_sessions_expires ON web_sessions(expires_at);
 """
 
 
@@ -119,7 +129,6 @@ async def update_notification_settings(pool, chat_id: str, settings: dict):
 
 # ─── Watchlist Operations ───
 async def create_watchlist(pool, chat_id: str, name: str, filters: dict, source_video_url: str = None) -> int:
-    import json
     async with pool.acquire() as conn:
         row = await conn.fetchrow("""
             INSERT INTO watchlists (chat_id, name, filters, source_video_url)
@@ -144,7 +153,6 @@ async def get_watchlist(pool, watchlist_id: int) -> dict:
 
 
 async def update_watchlist(pool, watchlist_id: int, name: str = None, filters: dict = None, is_active: bool = None):
-    import json
     async with pool.acquire() as conn:
         if name is not None:
             await conn.execute("UPDATE watchlists SET name = $1, updated_at = NOW() WHERE id = $2", name, watchlist_id)
@@ -172,7 +180,8 @@ async def get_active_watchlists(pool) -> list:
 
 
 # ─── Alert History ───
-async def get_today_alerted_tickers(pool, watchlist_id: int, today: str) -> set:
+async def get_today_alerted_tickers(pool, watchlist_id: int, today: date) -> set:
+    """today: datetime.date 객체"""
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             "SELECT ticker FROM alert_history WHERE watchlist_id = $1 AND matched_at = $2",
@@ -181,8 +190,8 @@ async def get_today_alerted_tickers(pool, watchlist_id: int, today: str) -> set:
         return {r["ticker"] for r in rows}
 
 
-async def save_alert(pool, watchlist_id: int, ticker: str, stock_name: str, matched_data: dict, matched_at: str):
-    import json
+async def save_alert(pool, watchlist_id: int, ticker: str, stock_name: str, matched_data: dict, matched_at: date):
+    """matched_at: datetime.date 객체"""
     async with pool.acquire() as conn:
         try:
             await conn.execute("""
@@ -203,3 +212,24 @@ async def get_alert_history(pool, watchlist_id: int, limit: int = 50) -> list:
             LIMIT $2
         """, watchlist_id, limit)
         return [dict(r) for r in rows]
+
+
+# ─── Web Sessions ───
+async def create_web_session(pool, chat_id: str, token: str, expires_at) -> None:
+    """웹 세션 토큰 저장"""
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO web_sessions (token, chat_id, expires_at)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (token) DO UPDATE SET chat_id = $2, expires_at = $3
+        """, token, chat_id, expires_at)
+
+
+async def get_web_session(pool, token: str) -> dict | None:
+    """웹 세션 토큰 검증 (만료 체크 포함)"""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM web_sessions WHERE token = $1 AND expires_at > NOW()",
+            token
+        )
+        return dict(row) if row else None
