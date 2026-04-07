@@ -250,8 +250,60 @@ async def _fetch_krx_direct(today_str: str) -> pd.DataFrame | None:
     return df
 
 
+async def _fetch_kis_bulk_data() -> pd.DataFrame | None:
+    """한투 API로 주요 종목 재무 데이터 직접 수집 (pykrx/KRX 모두 실패 시 최종 fallback)"""
+    try:
+        # FinanceDataReader로 전종목 코드 가져오기
+        import FinanceDataReader as fdr
+        listing = fdr.StockListing('KRX')
+        tickers = listing['Code'].tolist()
+        logger.info(f"KIS bulk: {len(tickers)} tickers from FDR")
+
+        # 시가총액 상위 300개만 조회 (API 호출 수 관리)
+        # FDR의 Marcap 컬럼으로 정렬
+        if 'Marcap' in listing.columns:
+            listing = listing.sort_values('Marcap', ascending=False)
+            tickers = listing['Code'].head(300).tolist()
+        else:
+            tickers = tickers[:300]
+
+        logger.info(f"KIS bulk: fetching top {len(tickers)} by market cap")
+
+        # 병렬로 현재가+PER/PBR 조회 (get_stock_price가 PER, PBR 포함)
+        tasks = [get_stock_detail_throttled(t) for t in tickers]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        records = []
+        for r in results:
+            if isinstance(r, Exception) or not r:
+                continue
+            records.append(r)
+
+        if not records:
+            return None
+
+        df = pd.DataFrame(records)
+        if 'ticker' in df.columns:
+            df = df.set_index('ticker')
+
+        # 컬럼명을 대문자로 (pykrx 호환)
+        col_map = {}
+        for c in df.columns:
+            if c.lower() in ('per', 'pbr', 'eps', 'bps', 'div', 'dps', 'roe', 'roa'):
+                col_map[c] = c.upper()
+        if col_map:
+            df = df.rename(columns=col_map)
+
+        logger.info(f"KIS bulk data loaded: {len(df)} stocks")
+        return df
+
+    except Exception as e:
+        logger.error(f"KIS bulk fetch failed: {e}")
+        return None
+
+
 async def _fetch_all_market_data() -> dict | None:
-    """pykrx → KRX 직접 API 순서로 전종목 데이터 조회. 당일 데이터 없으면 직전 거래일까지 시도."""
+    """pykrx → KRX 직접 API → 한투 API 배치 순서로 전종목 데이터 조회."""
     from datetime import timedelta as td
 
     today = datetime.now(KST).date()
@@ -273,6 +325,13 @@ async def _fetch_all_market_data() -> dict | None:
                 logger.info(f"Using data from {date_str} ({days_back} days ago)")
             return {"date": date_str, "data": df, "source": source}
 
+    # 최종 fallback: 한투 API로 직접 수집
+    logger.warning("pykrx/KRX both failed, falling back to KIS bulk fetch")
+    df = await _fetch_kis_bulk_data()
+    if df is not None and not df.empty:
+        today_str = today.strftime("%Y%m%d")
+        return {"date": today_str, "data": df, "source": "kis_bulk"}
+
     return None
 
 
@@ -290,6 +349,45 @@ async def get_cached_market_data(max_age_sec: int = 300) -> dict | None:
 
 
 # ─── 하이브리드 스크리닝 (#1) ───
+
+def _apply_basic_filters_extended(df: pd.DataFrame, filters: dict) -> tuple[pd.DataFrame, list[str], dict]:
+    """kis_bulk 소스용: 모든 필터를 DataFrame에 직접 적용 (ROE/ROA 등 이미 포함)"""
+    results = df.copy()
+    applied = []
+
+    for key, value in filters.items():
+        parts = key.rsplit("_", 1)
+        if len(parts) != 2:
+            continue
+        col, op = parts[0], parts[1]
+
+        # 컬럼명 매칭 (대소문자 무시)
+        matched_col = None
+        for c in results.columns:
+            if c.lower() == col.lower():
+                matched_col = c
+                break
+        if matched_col is None:
+            continue
+
+        try:
+            results[matched_col] = pd.to_numeric(results[matched_col], errors='coerce')
+            if op == "lte":
+                results = results[(results[matched_col] <= value) & (results[matched_col] > 0)]
+            elif op == "gte":
+                results = results[results[matched_col] >= value]
+            elif op == "lt":
+                results = results[(results[matched_col] < value) & (results[matched_col] > 0)]
+            elif op == "gt":
+                results = results[results[matched_col] > value]
+            elif op == "eq":
+                results = results[results[matched_col] == value]
+            applied.append(f"{matched_col} {op} {value}")
+        except Exception as e:
+            logger.warning(f"Filter {key}={value}: {e}")
+
+    return results, applied, {}  # 빈 detail_filters (모두 적용 완료)
+
 
 def _apply_basic_filters(df: pd.DataFrame, filters: dict) -> tuple[pd.DataFrame, list[str], dict]:
     """기본 필터(PER, PBR, EPS, BPS, DIV, DPS) 적용. 상세 필터는 분리 반환."""
@@ -386,13 +484,25 @@ async def screen_stocks_hybrid(filters: dict) -> dict:
     # 1단계: 전종목 기본 지표 (캐시 사용)
     market_data = await get_cached_market_data()
     if market_data is None:
-        return {"error": "시장 데이터를 가져올 수 없습니다. 장 운영 시간을 확인해주세요.", "date": today_str}
+        return {"error": "시장 데이터를 가져올 수 없습니다", "date": today_str}
 
     df = market_data["data"]
     source = market_data["source"]
 
+    # kis_bulk 소스는 이미 ROE/ROA 등 상세 지표 포함 → 모든 필터를 기본 필터처럼 적용 가능
+    if source == "kis_bulk":
+        # kis_bulk에서는 모든 필터를 직접 적용
+        all_cols = {c.lower() for c in df.columns}
+        basic_cols_extended = all_cols  # 모든 컬럼을 기본으로 취급
+    else:
+        basic_cols_extended = None  # 기본 동작
+
     # 기본 필터 적용
-    candidates, applied_basic, detail_filters = _apply_basic_filters(df, filters)
+    if source == "kis_bulk":
+        # kis_bulk: 모든 필터를 한번에 적용
+        candidates, applied_basic, detail_filters = _apply_basic_filters_extended(df, filters)
+    else:
+        candidates, applied_basic, detail_filters = _apply_basic_filters(df, filters)
     logger.info(f"[1단계] {source}: {len(df)} → {len(candidates)} after basic filters")
 
     # 2단계: 상세 필터가 있으면 KIS API로 상세 재무 조회
